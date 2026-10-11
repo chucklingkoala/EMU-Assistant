@@ -1,0 +1,45 @@
+[package]
+name = "emu-assistant"
+version = "0.2.0"
+edition = "2021"
+description = "EMU Assistant: copy selected ES-DE systems, emulators and ES-DE itself to an external drive and deploy them on another machine"
+authors = ["ChucklingKoala <techteam@chucklingkoala.com>", "Claude (Anthropic)"]
+repository = "https://github.com/chucklingkoala/EMU-Assistant"
+
+[[bin]]
+name = "EMUAssistant"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.29"
+image = { version = "0.25", default-features = false, features = ["png"] }
+quick-xml = "0.36"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+rfd = "0.15"
+filetime = "0.2"
+crossbeam-channel = "0.5"
+anyhow = "1"
+dirs = "5"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+] }
+
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+ico = "0.3"
+winresource = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[profile.release]
+lto = true
+strip = true
