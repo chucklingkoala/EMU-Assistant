@@ -11,11 +11,13 @@
 
 <p align="center">
   Pack up your <a href="https://es-de.org">ES-DE</a> setup and take it with you.<br>
-  Pick the consoles you want, copy them to an external drive, then deploy them on a handheld or second PC: ROMs, emulators, BIOS, scraped media, ES-DE and all.
+  Pick the consoles you want, copy them to an external drive, then deploy them on a handheld or second PC: ROMs, emulators, BIOS, scraped media, ES-DE and all.<br>
+  It also keeps ES-DE, RetroArch and your emulators up to date, with a backup of every update.
 </p>
 
 <p align="center">
-  <img src="docs/images/export.png" alt="EMU Assistant export screen" width="900">
+  <img src="docs/images/export.png" alt="EMU Assistant export screen" width="900"><br>
+  <img src="docs/images/update.png" alt="EMU Assistant update screen" width="900">
 </p>
 
 ---
@@ -25,7 +27,8 @@
 Say your main emulation box has terabytes of games, and your handheld (a ROG Ally, Legion Go, Steam Deck running Windows…) has room for only some of them. EMU Assistant moves that subset for you:
 
 1. **Export:** on the main machine, tick the consoles you want. EMU Assistant works out which emulators those consoles use and copies everything to an external drive. This covers the ROMs, the emulators (with their BIOS files, configs and saves), the scraped media, the gamelists and ES-DE itself. Folder paths stay the same.
-2. **Deploy:** plug the drive into the handheld and run `EMU Assistant.exe` from the drive. It copies everything into place and points ES-DE at the new ROM folder.
+2. **Deploy:** plug the drive into the handheld and run `EMUAssistant.exe` from the drive. It copies everything into place and points ES-DE at the new ROM folder.
+3. **Update:** check for newer builds of ES-DE, RetroArch (and its cores) and your portable emulators, and install the ones you tick. Every file an update replaces is saved in a zip first, so you can roll it back.
 
 Copies are **incremental and resumable**. Files that are already up to date are skipped, and an interrupted copy picks up where it stopped. **Newer files at the destination are never overwritten**, so save games made on the handheld are safe.
 
@@ -42,6 +45,8 @@ Copies are **incremental and resumable**. Files that are already up to date are 
   - Newer files at the destination are kept, and an optional verify pass re-reads each copy.
 - **Skip the bulk you don't need:** RetroArch's cheat database and its menu thumbnails can be left out. Both can be downloaded again from RetroArch's online updater.
 - **Mirror mode (optional):** deletes ROMs and media at the destination that you've removed at the source. It always asks first.
+- **Program updates:** finds the newest release of ES-DE, RetroArch and the portable emulators you have installed, and updates only the ones you tick. RetroArch cores can be updated too. Settings and saves are never overwritten, and a backup zip lets you undo an update, completely or file by file.
+- **Settings (⚙):** preferences that don't change from run to run live behind the cog in the top right corner and are remembered.
 - **A single small `.exe`** with no installer and no runtime. It remembers your last selection.
 
 ## Requirements
@@ -73,24 +78,58 @@ When the copy finishes, the drive contains:
 
 ```
 E:\
-├── EMU Assistant.exe          ← the app, ready for the other machine
-├── EMU Assistant\manifest.json← what was exported, and from where
+├── EMUAssistant.exe           ← the app, ready for the other machine
+├── EMUAssistant\manifest.json ← what was exported, and from where
 ├── Emulation\ES-DE\...        ← ES-DE, Emulators\, gamelists, media (same paths as the source)
 └── Games\ROMs\...             ← only the consoles you selected
 ```
 
-Exporting again later only copies what changed. Selecting more consoles adds them to the same drive.
+Exporting again later only copies what changed. Selecting more consoles adds them to the same drive. Drives exported with an older version (which used `EMU Assistant\` and `EMU Assistant.exe`) are still recognized and are switched to the new names on the next export.
 
 ### 2. Deploy from the drive (handheld / second PC)
 
 <img src="docs/images/deploy.png" alt="Deploy screen" width="900">
 
-1. Plug in the drive and run **`EMU Assistant.exe` from the drive**. It opens in **Deploy** mode with the package already loaded.
+1. Plug in the drive and run **`EMUAssistant.exe` from the drive**. It opens in **Deploy** mode with the package already loaded.
 2. Check the **target folders**. They default to the same paths as on the main machine, but each one can be changed. For example, ROMs can go to an SD card while ES-DE stays on `C:`. Changing the ES-DE folder moves the ROM and media folders with it if they were inside it.
 3. Untick any consoles you don't want on this machine.
 4. Press **Analyze**, then **Deploy to this machine**.
 
 If the ROM or media folder ends up somewhere different from the main machine, EMU Assistant updates `ROMDirectory` and `MediaDirectory` in the target's `es_settings.xml`. The original is kept as `es_settings.xml.emuasist-bak`. Start ES-DE and play.
+
+### 3. Update programs
+
+<img src="docs/images/update.png" alt="Update programs screen after a check" width="900">
+
+1. Open the **Update programs** tab. It lists ES-DE and every emulator that ES-DE's find rules locate on this machine. Emulators that aren't installed don't appear and are never checked.
+2. Press **Check for updates**. For each program you'll see the installed version, the latest release and the download size.
+   - *version unknown*: the program doesn't record its version. EMU Assistant compares build dates to say whether it is probably current. After one update through EMU Assistant the version is known.
+   - Programs under `Program Files` were installed with an installer and aren't listed; they're left to their own updater. Launchers such as Steam aren't listed either.
+3. **Tick the programs to update.** Nothing is ticked for you. *Tick all with updates* ticks only the programs with a known newer version. For RetroArch, cores that have newer builds are updated along with it.
+4. Press **Update selected**. For each program EMU Assistant downloads the release, unpacks it, saves every file it is about to replace in a backup zip, then installs. If anything goes wrong mid-way, the backup is put back automatically.
+
+What's never overwritten: existing `.ini`, `.cfg` and `.yml` files, `portable.txt`, RetroArch's `config`, `saves`, `states`, `system`, `playlists` and `screenshots` folders, and ES-DE's own `ES-DE`, `ROMs` and `Emulators` folders.
+
+<img src="docs/images/restore.png" alt="Restore window with one backup partly ticked" width="900">
+
+**Rolling back:** press **Restore…**, tick a backup to undo that update completely, or expand it and tick single files. Restoring puts the replaced files back and deletes the files the update added. Backups go to `<ES-DE folder>\EMUAssistant\backups` (one zip per program per update, the last 3 per program are kept). That folder stays on this machine and isn't exported.
+
+Update on your main machine, then export: the new versions travel to the drive and the handheld like any other change.
+
+#### Where updates come from
+
+| Program | Source |
+|---|---|
+| ES-DE | ES-DE releases on GitLab (portable zip) |
+| RetroArch | stable builds from buildbot.libretro.com; cores from its nightly builds, like RetroArch's online updater |
+| ares, Azahar, Cemu, DOSBox-Staging, DOSBox-X, DuckStation, Flycast, Gearboy, jgenesis, melonDS, Mesen, mGBA, NooDS, Panda3DS, PCSX2, PPSSPP, RPCS3, SameBoy, shadPS4, simple64, Snes9x, Stella, VBA-M, Vita3K, xemu, Xenia Canary, Ymir | the project's GitHub releases |
+| Eden | Eden's releases at git.eden-emu.dev |
+
+<img src="docs/images/settings.png" alt="Settings, Update sources tab" width="900">
+
+Stable releases are used where a project has them; projects that only publish rolling builds get their newest build. For any other emulator, or to choose a different build (e.g. Eden's ROG Ally build), open **⚙ Settings > Update sources** and set a GitHub, GitLab or Gitea/Forgejo repository, or a direct download link, plus an optional file pattern such as `*windows-x64*.zip`.
+
+GitHub allows 60 checks an hour without signing in. If you hit that, add a GitHub token (no permissions needed) under **⚙ Settings > Updates**.
 
 ## The fuel can
 
@@ -113,15 +152,32 @@ The **Destination** panel shows how full each target drive will be once the sync
 
 <img src="docs/images/export-options.png" alt="Options, ES-DE and emulator panels" width="900">
 
+The side panel holds the choices you make for each run:
+
 | Option | Default | What it does |
 |---|---|---|
 | Gamelists of selected systems | on | Copies `ES-DE\gamelists\<system>` (game metadata, favourites, play counts). |
 | Scraped media of selected systems | on | Copies `downloaded_media\<system>` (box art, screenshots, videos) for the **selected consoles only**. |
-| Skip RetroArch cheats | on | Leaves out RetroArch's cheat database (tens of thousands of small files). |
-| Skip RetroArch thumbnails | on | Leaves out RetroArch's own menu thumbnails. ES-DE doesn't use them. |
-| Keep newer files at destination | on | Never overwrites a file that is newer at the destination, e.g. saves or configs changed on the handheld. Such files are listed after Analyze. |
 | Delete files missing from source | off | Mirror mode for **ROMs and media only**. Removes destination files you've deleted at the source. Emulators and ES-DE files are never deleted. You'll see the list and must confirm. |
-| Verify after copy | off | Re-reads every copied file and compares it byte for byte with the source. |
+
+### Settings (⚙)
+
+Preferences that stay the same from run to run are behind the **cog** in the top right corner. They're saved straight away.
+
+| Tab | Setting | Default | What it does |
+|---|---|---|---|
+| General | Keep newer files at destination | on | Never overwrites a file that is newer at the destination, e.g. saves or configs changed on the handheld. Such files are listed after Analyze. |
+| General | Verify after copy | off | Re-reads every copied file and compares it byte for byte with the source. |
+| Export / Deploy | Skip RetroArch cheats | on | Leaves out RetroArch's cheat database (tens of thousands of small files). |
+| Export / Deploy | Skip RetroArch thumbnails | on | Leaves out RetroArch's own menu thumbnails. ES-DE doesn't use them. |
+| Export | Copy EMUAssistant.exe to the drive | on | Puts the app on the drive, ready to deploy on the other machine. |
+| Deploy | Update ES-DE's ROM and media folders | on | Points `es_settings.xml` at the new ROM and media folders when they moved. |
+| Updates | Back up replaced files (zip) | on | Saves the files an update replaces so it can be restored. |
+| Updates | Update RetroArch cores | on | Also updates the cores already in RetroArch's `cores` folder. |
+| Updates | Keep the last N backups per program | 3 | Older backups are deleted (0 keeps all). |
+| Updates | Backup folder | `<ES-DE>\EMUAssistant\backups` | Where the backup zips go. |
+| Updates | GitHub token | — | Optional, for more than 60 checks an hour. `GITHUB_TOKEN` is used when set. |
+| Update sources | per program | built-in | Where each program's updates come from (see [Where updates come from](#where-updates-come-from)). |
 
 **ES-DE section:** choose whether to copy the ES-DE application itself, its settings and custom systems, your themes, custom collections, and the small files in the root of the ROM folder.
 
@@ -164,7 +220,12 @@ Emulators that live **outside** the ES-DE folder are still copied, to the same p
   EMUAssistant.exe --dump "D:\Emulation\ES-DE"
   ```
   This prints the detected ROM and media folders, every system with its emulators, and where each emulator was found.
-- Your last ES-DE folder, destination and selection are remembered in `%APPDATA%\EMU Assistant\config.json`.
+- **Check for updates without the GUI:**
+  ```
+  EMUAssistant.exe --check-updates "D:\Emulation\ES-DE"
+  ```
+- **An update says the download doesn't contain the program:** the project changed its file names. Open **⚙ Settings > Update sources** and adjust the file pattern.
+- Your last ES-DE folder, destination, selection and settings are remembered in `%APPDATA%\EMUAssistant\config.json`. Settings from earlier versions (`%APPDATA%\EMU Assistant`) are picked up automatically.
 
 ## Building from source
 
@@ -183,8 +244,8 @@ cargo test
 
 ```
 src/
-  main.rs            entry point, window setup, --dump
-  ui.rs              egui interface, theme
+  main.rs            entry point, window setup, --dump, --check-updates
+  ui.rs              egui interface, theme, Settings and Restore windows
   gauge.rs           fuel-can widget
   gauge_geom.rs      liquid-surface geometry for the can sprites
   scan.rs            reads an ES-DE install into systems / emulators / groups
@@ -194,6 +255,8 @@ src/
   manifest.rs        the package description stored on the drive
   deploy.rs          es_settings.xml fix-up on the target
   drives.rs          drive list and free space (Win32)
+  update/            Update mode: sources.rs (where releases come from), http.rs,
+                     archive.rs (zip/7z, backup zips), version.rs (installed versions)
   paths.rs, fsutil.rs, config.rs
 assets/              fuel-can sprites (generated)
 examples/make_tank_sprites.rs   regenerates the sprites from "emu tank.jpg"

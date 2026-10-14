@@ -13,6 +13,7 @@ mod plan;
 mod scan;
 mod sync;
 mod ui;
+mod update;
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -35,6 +36,15 @@ fn main() -> anyhow::Result<()> {
         let cat = scan::scan(&root, &AtomicBool::new(false), &mut |s| eprintln!("{s}"))?;
         scan::print_catalog(&cat);
         return Ok(());
+    }
+    if args.get(1).map(String::as_str) == Some("--check-updates") {
+        attach_console();
+        let root = args
+            .get(2)
+            .map(PathBuf::from)
+            .or_else(scan::detect_es_root_near_exe)
+            .context("usage: EMUAssistant --check-updates <ES-DE folder>")?;
+        return update::print_check(&root, &config::load().update_opts(&root));
     }
 
     let mut viewport = egui::ViewportBuilder::default()

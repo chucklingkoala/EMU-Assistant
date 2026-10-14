@@ -1,4 +1,4 @@
-//! `<drive>\emuasist\manifest.json`: what was exported, from where. Deploy mode reads it.
+//! `<drive>\EMUAssistant\manifest.json`: what was exported, from where. Deploy mode reads it.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,10 +10,12 @@ use crate::paths::eq_ci;
 use crate::plan::Selection;
 use crate::scan::Catalog;
 
-pub const DIR: &str = "EMU Assistant";
-/// Folder used by versions before the rename to EMU Assistant.
-const LEGACY_DIR: &str = "emuasist";
-pub const EXE_NAME: &str = "EMU Assistant.exe";
+pub const DIR: &str = "EMUAssistant";
+/// Folders used by earlier versions, newest first.
+const LEGACY_DIRS: [&str; 2] = ["EMU Assistant", "emuasist"];
+pub const EXE_NAME: &str = "EMUAssistant.exe";
+/// Name of the exe copied to the drive by earlier versions.
+pub const LEGACY_EXE_NAME: &str = "EMU Assistant.exe";
 const FORMAT: u32 = 1;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -31,9 +33,22 @@ pub fn path(root: &Path) -> PathBuf {
     root.join(DIR).join("manifest.json")
 }
 
-/// The manifest to read: the current location, or the pre-rename one.
+/// The manifest to read: the current location, or a pre-rename one.
 fn existing_path(root: &Path) -> Option<PathBuf> {
-    [path(root), root.join(LEGACY_DIR).join("manifest.json")].into_iter().find(|p| p.is_file())
+    std::iter::once(path(root))
+        .chain(LEGACY_DIRS.iter().map(|d| root.join(d).join("manifest.json")))
+        .find(|p| p.is_file())
+}
+
+/// Renames a package folder left by an earlier version to [`DIR`].
+fn migrate_legacy(root: &Path) {
+    let dir = root.join(DIR);
+    if dir.exists() {
+        return;
+    }
+    if let Some(old) = LEGACY_DIRS.iter().map(|d| root.join(d)).find(|d| d.join("manifest.json").is_file()) {
+        let _ = std::fs::rename(old, dir);
+    }
 }
 
 pub fn exists(root: &Path) -> bool {
@@ -49,6 +64,7 @@ pub fn load(root: &Path) -> Result<Option<Manifest>> {
 }
 
 pub fn save(root: &Path, m: &Manifest) -> Result<()> {
+    migrate_legacy(root);
     let p = path(root);
     std::fs::create_dir_all(p.parent().unwrap())?;
     let tmp = p.with_extension("json.tmp");
@@ -153,10 +169,17 @@ mod tests {
     fn reads_pre_rename_location() {
         let tmp = tempfile::tempdir().unwrap();
         let m = for_export(None, &Catalog::default(), &Selection::default());
-        let legacy = tmp.path().join(LEGACY_DIR);
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("manifest.json"), serde_json::to_string(&m).unwrap()).unwrap();
-        assert!(exists(tmp.path()));
-        assert!(load(tmp.path()).unwrap().is_some());
+        for legacy in LEGACY_DIRS {
+            let root = tmp.path().join(legacy.replace(' ', "_"));
+            let dir = root.join(legacy);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("manifest.json"), serde_json::to_string(&m).unwrap()).unwrap();
+            assert!(exists(&root));
+            assert!(load(&root).unwrap().is_some());
+            // the next save moves the package to the new folder name
+            save(&root, &m).unwrap();
+            assert!(!dir.exists());
+            assert!(path(&root).is_file());
+        }
     }
 }

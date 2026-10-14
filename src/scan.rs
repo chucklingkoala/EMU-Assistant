@@ -177,7 +177,15 @@ pub fn scan(es_root: &Path, cancel: &AtomicBool, status: &mut dyn FnMut(String))
     syslist.sort_by_key(|s| s.fullname.to_lowercase());
 
     status("Measuring ES-DE folders…".into());
-    let mut program_ex = vec![data.clone(), es_root.join("Emulators"), es_root.join("ROMs"), rom_dir.clone(), media_dir.clone()];
+    // EMUAssistant\ holds update backups, which stay on this machine
+    let mut program_ex = vec![
+        data.clone(),
+        es_root.join("Emulators"),
+        es_root.join("ROMs"),
+        es_root.join(crate::manifest::DIR),
+        rom_dir.clone(),
+        media_dir.clone(),
+    ];
     program_ex.extend(
         emulators
             .values()
@@ -323,7 +331,7 @@ fn retroarch_optional_dirs(dir: &Path) -> Vec<OptionalDir> {
         .collect()
 }
 
-fn not_copyable_reason(dir: &Path, es_root: &Path) -> Option<&'static str> {
+pub fn not_copyable_reason(dir: &Path, es_root: &Path) -> Option<&'static str> {
     if dir.parent().is_none() {
         return Some("sits in a drive root, not copied");
     }
@@ -339,7 +347,7 @@ fn not_copyable_reason(dir: &Path, es_root: &Path) -> Option<&'static str> {
     None
 }
 
-fn is_program_files(dir: &Path) -> bool {
+pub fn is_program_files(dir: &Path) -> bool {
     ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"]
         .iter()
         .filter_map(|v| std::env::var_os(v))

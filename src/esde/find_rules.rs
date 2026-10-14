@@ -166,7 +166,8 @@ fn find_static(path: &str) -> Option<PathBuf> {
     candidates.into_iter().find(|c| c.exists())
 }
 
-fn wildcard(pattern: &str, name: &str) -> bool {
+/// Case-insensitive match of `name` against a pattern with `*` wildcards.
+pub fn wildcard(pattern: &str, name: &str) -> bool {
     let p = pattern.to_lowercase();
     let n = name.to_lowercase();
     let parts: Vec<&str> = p.split('*').collect();

@@ -1,6 +1,6 @@
 [package]
 name = "emu-assistant"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "EMU Assistant: copy selected ES-DE systems, emulators and ES-DE itself to an external drive and deploy them on another machine"
 authors = ["ChucklingKoala <techteam@chucklingkoala.com>", "Claude (Anthropic)"]
@@ -22,6 +22,9 @@ filetime = "0.2"
 crossbeam-channel = "0.5"
 anyhow = "1"
 dirs = "5"
+ureq = { version = "=3.4.2", features = ["json"] }
+zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
+sevenz-rust2 = { version = "=0.23.0", default-features = false, features = ["util"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

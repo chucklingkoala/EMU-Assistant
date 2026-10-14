@@ -1,4 +1,5 @@
-//! egui front-end: Export (ES-DE -> drive) and Deploy (drive -> this machine).
+//! egui front-end: Export (ES-DE -> drive), Deploy (drive -> this machine) and
+//! Update (newer ES-DE / emulator builds), plus the Settings and Restore windows.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -21,6 +22,9 @@ use crate::paths::{eq_ci, normalize, volume_root};
 use crate::plan::{self, Mapper, Plan, PlanOptions, Selection};
 use crate::scan::{self, Catalog, EmuEntry, Roots};
 use crate::sync::{self, Event, Progress, Report};
+use crate::update::archive::BackupMeta;
+use crate::update::sources::{self, Kind};
+use crate::update::{self, Status, UpdateItem};
 use crate::APP_NAME;
 
 // Palette: #1a1c28 base with the icon's cyan / purple / blue as highlights.
@@ -92,6 +96,16 @@ fn emu_bytes(e: &EmuEntry, sel: &Selection) -> u64 {
 enum Mode {
     Export,
     Deploy,
+    Update,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum SettingsTab {
+    General,
+    Export,
+    Deploy,
+    Updates,
+    Sources,
 }
 
 /// Messages from scan / analyze worker threads.
@@ -100,20 +114,36 @@ enum Msg<T> {
     Done(anyhow::Result<T>),
 }
 
+/// What a finished copy-style job was, to decide what happens next.
+#[derive(Clone, Copy)]
+enum After {
+    /// Export / deploy: analyze again.
+    Replan,
+    Updated,
+    Restored,
+}
+
 enum Job {
     Scan { rx: Receiver<Msg<Catalog>>, cancel: Arc<AtomicBool> },
     Plan { rx: Receiver<Msg<Plan>>, cancel: Arc<AtomicBool>, fp: String },
-    Copy { rx: Receiver<Event>, cancel: Arc<AtomicBool> },
+    Check { rx: Receiver<Msg<Vec<UpdateItem>>>, cancel: Arc<AtomicBool> },
+    Copy { rx: Receiver<Event>, cancel: Arc<AtomicBool>, after: After },
 }
 
 impl Job {
     fn cancel(&self) {
         match self {
-            Job::Scan { cancel, .. } | Job::Plan { cancel, .. } | Job::Copy { cancel, .. } => {
+            Job::Scan { cancel, .. } | Job::Plan { cancel, .. } | Job::Check { cancel, .. } | Job::Copy { cancel, .. } => {
                 cancel.store(true, Ordering::Relaxed)
             }
         }
     }
+}
+
+/// Files ticked in one backup of the Restore window.
+struct RestorePick {
+    files: BTreeSet<String>,
+    expanded: bool,
 }
 
 pub struct App {
@@ -134,9 +164,21 @@ pub struct App {
     sel: Selection,
     emu_override: BTreeMap<String, bool>,
     filter: String,
-    protect_newer: bool,
     prune: bool,
-    verify: bool,
+    // update
+    upd_items: Vec<UpdateItem>,
+    upd_root: Option<PathBuf>,
+    upd_checked: bool,
+    /// Outcome of the last update / restore: (text, succeeded).
+    upd_result: Option<(String, bool)>,
+    // windows
+    settings_open: bool,
+    settings_tab: SettingsTab,
+    /// Program outlined in Update sources, and whether to scroll to it.
+    settings_focus: Option<(String, bool)>,
+    restore_open: bool,
+    backups: Vec<(PathBuf, BackupMeta)>,
+    restore_picks: BTreeMap<PathBuf, RestorePick>,
     // state
     drives: Vec<DriveInfo>,
     job: Option<Job>,
@@ -170,9 +212,17 @@ impl App {
             sel: Selection::default(),
             emu_override: BTreeMap::new(),
             filter: String::new(),
-            protect_newer: true,
             prune: false,
-            verify: false,
+            upd_items: Vec::new(),
+            upd_root: None,
+            upd_checked: false,
+            upd_result: None,
+            settings_open: false,
+            settings_tab: SettingsTab::General,
+            settings_focus: None,
+            restore_open: false,
+            backups: Vec::new(),
+            restore_picks: BTreeMap::new(),
             drives: drives::list(),
             job: None,
             status: String::new(),
@@ -213,6 +263,7 @@ impl App {
         match self.mode {
             Mode::Export => self.export_cat.clone(),
             Mode::Deploy => self.deploy_cat.clone(),
+            Mode::Update => None,
         }
     }
 
@@ -234,7 +285,7 @@ impl App {
             self.t_rom.trim(),
             self.t_media.trim(),
             &self.sel,
-            self.protect_newer,
+            self.cfg.protect_newer(),
             self.prune,
         ))
         .unwrap_or_default()
@@ -254,6 +305,7 @@ impl App {
         let all_globals: BTreeSet<String> = cat.globals.iter().map(|g| g.id.clone()).collect();
         let all_systems = cat.systems.iter().map(|s| s.name.clone());
         match self.mode {
+            Mode::Update => {}
             Mode::Export => {
                 self.sel = Selection {
                     systems: all_systems.filter(|s| self.cfg.systems.contains(s)).collect(),
@@ -276,8 +328,8 @@ impl App {
                     globals: all_globals,
                     media: true,
                     gamelists: true,
-                    exclude_cheats: true,
-                    exclude_thumbnails: true,
+                    exclude_cheats: self.cfg.exclude_cheats.unwrap_or(true),
+                    exclude_thumbnails: self.cfg.exclude_thumbnails.unwrap_or(true),
                 };
                 self.emu_override.clear();
             }
@@ -388,6 +440,7 @@ impl App {
             }
         };
         match self.mode {
+            Mode::Update => Err("not used in Update mode".into()),
             Mode::Export => {
                 let dest = abs(&self.dest, "Destination")?;
                 if !dest.is_dir() {
@@ -420,7 +473,7 @@ impl App {
             self.status = "Nothing selected".into();
             return;
         }
-        let opts = PlanOptions { protect_newer: self.protect_newer, prune: self.prune };
+        let opts = PlanOptions { protect_newer: self.cfg.protect_newer(), prune: self.prune };
         let (tx, rx) = unbounded();
         let cancel = Arc::new(AtomicBool::new(false));
         let c = cancel.clone();
@@ -455,13 +508,15 @@ impl App {
         let (tx, rx) = unbounded();
         let cancel = Arc::new(AtomicBool::new(false));
         let c = cancel.clone();
-        let verify = self.verify;
+        let verify = self.cfg.verify();
         match self.mode {
+            Mode::Update => return,
             Mode::Export => {
                 let (Some(cat), Ok(Mapper::Export { dest_root })) = (self.export_cat.clone(), self.mapper()) else {
                     return;
                 };
                 let sel = self.sel.clone();
+                let copy_exe = self.cfg.copy_exe();
                 self.remember_export(&dest_root);
                 thread::spawn(move || {
                     let log = |s: String| {
@@ -480,19 +535,22 @@ impl App {
                     if let Err(e) = manifest::save(&dest_root, &m) {
                         log(format!("Could not write manifest: {e:#}"));
                     }
-                    match copy_self(&dest_root) {
-                        Ok(Some(p)) => log(format!("Copied EMU Assistant to {} (run it on the target machine to deploy)", p.display())),
-                        Ok(None) => {}
-                        Err(e) => log(format!("Could not copy EMU Assistant itself to the drive: {e:#}")),
+                    if copy_exe {
+                        match copy_self(&dest_root) {
+                            Ok(Some(p)) => log(format!("Copied EMU Assistant to {} (run it on the target machine to deploy)", p.display())),
+                            Ok(None) => {}
+                            Err(e) => log(format!("Could not copy EMU Assistant itself to the drive: {e:#}")),
+                        }
                     }
                     let _ = tx.send(Event::Done(report));
                 });
             }
             Mode::Deploy => {
                 let target = self.target_roots();
+                let fix_settings = self.cfg.fix_settings();
                 thread::spawn(move || {
                     let report = sync::execute(&plan, verify, &c, &tx);
-                    if !report.cancelled {
+                    if !report.cancelled && fix_settings {
                         match deploy::fix_settings(&target) {
                             Ok(msgs) => msgs.into_iter().for_each(|m| {
                                 let _ = tx.send(Event::Log(m));
@@ -506,11 +564,120 @@ impl App {
                 });
             }
         }
+        self.begin_copy_job(rx, cancel, After::Replan, "Copying…");
+    }
+
+    fn begin_copy_job(&mut self, rx: Receiver<Event>, cancel: Arc<AtomicBool>, after: After, status: &str) {
         self.progress = None;
         self.report = None;
+        self.upd_result = None;
         self.copy_started = Some(Instant::now());
-        self.status = "Copying…".into();
-        self.job = Some(Job::Copy { rx, cancel });
+        self.status = status.into();
+        self.job = Some(Job::Copy { rx, cancel, after });
+    }
+
+    // ---------- update mode ----------
+
+    fn es_root_path(&self) -> PathBuf {
+        normalize(Path::new(self.es_root.trim()))
+    }
+
+    /// Lists the installed programs (local, no network).
+    fn load_programs(&mut self) {
+        let root = self.es_root_path();
+        self.upd_checked = false;
+        match update::installed_programs(&root) {
+            Ok(p) => {
+                self.upd_items = update::local_items(p, &self.cfg.update_sources);
+                self.upd_root = Some(root);
+                self.status = format!("{} installed programs found. Press Check for updates.", self.upd_items.len());
+            }
+            Err(e) => {
+                self.upd_items.clear();
+                self.upd_root = None;
+                self.status = format!("{e:#}");
+            }
+        }
+    }
+
+    fn start_check(&mut self) {
+        let Some(root) = self.upd_root.clone() else { return };
+        let mut items = self.upd_items.clone();
+        let opts = self.cfg.update_opts(&root);
+        let (tx, rx) = unbounded();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c = cancel.clone();
+        thread::spawn(move || {
+            let res = update::check(&mut items, &opts, &c, &mut |s| {
+                let _ = tx.send(Msg::Status(s));
+            })
+            .map(|()| items);
+            let _ = tx.send(Msg::Done(res));
+        });
+        self.status = "Checking for updates…".into();
+        self.upd_result = None;
+        self.job = Some(Job::Check { rx, cancel });
+    }
+
+    fn update_targets(&self) -> Vec<UpdateItem> {
+        self.upd_items.iter().filter(|i| self.cfg.update_selected.contains(i.id()) && i.has_work()).cloned().collect()
+    }
+
+    fn start_update(&mut self) {
+        let Some(root) = self.upd_root.clone() else { return };
+        let items = self.update_targets();
+        if items.is_empty() {
+            return;
+        }
+        let opts = self.cfg.update_opts(&root);
+        let (tx, rx) = unbounded();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c = cancel.clone();
+        thread::spawn(move || {
+            let report = update::install(&items, &opts, &c, &tx);
+            let _ = tx.send(Event::Done(report));
+        });
+        self.begin_copy_job(rx, cancel, After::Updated, "Updating…");
+    }
+
+    fn backup_dir(&self) -> PathBuf {
+        self.cfg.backup_dir(&self.es_root_path())
+    }
+
+    fn open_restore(&mut self) {
+        self.backups = update::list_backups(&self.backup_dir());
+        self.restore_picks.retain(|p, _| self.backups.iter().any(|(b, _)| b == p));
+        self.restore_open = true;
+    }
+
+    fn start_restore(&mut self) {
+        // newest first, so restoring several backups of one program ends at the oldest state
+        let jobs: Vec<(PathBuf, Option<BTreeSet<String>>)> = self
+            .backups
+            .iter()
+            .filter_map(|(path, meta)| {
+                let pick = self.restore_picks.get(path).filter(|p| !p.files.is_empty())?;
+                let whole = pick.files.len() == meta.replaced.len() + meta.added.len();
+                Some((path.clone(), (!whole).then(|| pick.files.clone())))
+            })
+            .collect();
+        if jobs.is_empty() {
+            return;
+        }
+        let (tx, rx) = unbounded();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c = cancel.clone();
+        thread::spawn(move || {
+            let report = update::restore_backups(&jobs, &c, &tx);
+            let _ = tx.send(Event::Done(report));
+        });
+        self.restore_picks.clear();
+        self.begin_copy_job(rx, cancel, After::Restored, "Restoring…");
+    }
+
+    fn set_update_selected(&mut self, id: &str, on: bool) {
+        toggle(&mut self.cfg.update_selected, id, on);
+        config::save(&self.cfg);
     }
 
     fn poll_job(&mut self) {
@@ -554,7 +721,34 @@ impl App {
                     None
                 }
             },
-            Job::Copy { rx, cancel } => {
+            Job::Check { rx, cancel } => match drain(&rx, &mut self.status) {
+                None => Some(Job::Check { rx, cancel }),
+                Some(Ok(items)) => {
+                    let avail = items.iter().filter(|i| i.status == Status::Available).count();
+                    let cores: usize = items.iter().map(|i| i.cores.len()).sum();
+                    for i in &items {
+                        if let Status::Failed(e) = &i.status {
+                            self.log(format!("{}: {e}", i.id()));
+                        }
+                        if let Some(n) = &i.cores_note {
+                            self.log(format!("{}: {n}", i.id()));
+                        }
+                    }
+                    self.status = match (avail, cores) {
+                        (0, 0) => "Checked: no updates found".into(),
+                        (a, 0) => format!("Checked: {a} updates available"),
+                        (a, c) => format!("Checked: {a} updates available, {c} RetroArch cores have newer builds"),
+                    };
+                    self.upd_items = items;
+                    self.upd_checked = true;
+                    None
+                }
+                Some(Err(e)) => {
+                    self.status = format!("Check failed: {e:#}");
+                    None
+                }
+            },
+            Job::Copy { rx, cancel, after } => {
                 let mut done = None;
                 loop {
                     match rx.try_recv() {
@@ -572,9 +766,9 @@ impl App {
                     }
                 }
                 match done {
-                    None => Some(Job::Copy { rx, cancel }),
+                    None => Some(Job::Copy { rx, cancel, after }),
                     Some(r) => {
-                        self.finish_copy(r);
+                        self.finish_copy(r, after);
                         None
                     }
                 }
@@ -582,14 +776,39 @@ impl App {
         };
     }
 
-    fn finish_copy(&mut self, r: Report) {
-        for f in r.failed.iter().take(200) {
-            self.log(format!("Error: {f}"));
+    fn finish_copy(&mut self, r: Report, after: After) {
+        match after {
+            After::Replan => {
+                for f in r.failed.iter().take(200) {
+                    self.log(format!("Error: {f}"));
+                }
+                self.log(report_summary(&r));
+                self.plan = None;
+                // re-check right away so the gauge and columns show the real state of the destination
+                self.start_plan();
+            }
+            After::Updated | After::Restored => {
+                let s = update_summary(&r, after);
+                self.log(s.clone());
+                let ok = r.failed.is_empty() && !r.cancelled;
+                self.status = match (after, ok) {
+                    (After::Restored, true) => "Restore finished".into(),
+                    (_, true) => "Update finished".into(),
+                    (_, false) if r.cancelled => "Cancelled".into(),
+                    _ => "Finished with errors, see the log".into(),
+                };
+                self.upd_result = Some((s, ok));
+                // the bar's total is an estimate (core sizes are rounded); don't leave it half full
+                self.progress = None;
+                // installed versions changed: re-read them locally, no new download check
+                update::refresh(&mut self.upd_items);
+                // emulator folder sizes changed; Export rescans when opened
+                self.export_cat = None;
+                if self.restore_open {
+                    self.open_restore();
+                }
+            }
         }
-        self.log(report_summary(&r));
-        self.plan = None;
-        // re-check right away so the gauge and columns show the real state of the destination
-        self.start_plan();
         self.report = Some(r);
     }
 
@@ -602,13 +821,18 @@ impl App {
             ui.vertical(|ui| {
                 ui.add_space(2.0);
                 ui.label(RichText::new(APP_NAME).size(22.0).strong().color(Color32::WHITE));
-                ui.label(RichText::new("ES-DE export & deploy").small().color(ACCENT));
+                ui.label(RichText::new("ES-DE export, deploy & update").small().color(ACCENT));
             });
             ui.add_space(24.0);
             ui.add_enabled_ui(!busy, |ui| {
                 if ui.selectable_label(self.mode == Mode::Export, "  Export to drive  ").clicked() && self.mode != Mode::Export {
                     self.mode = Mode::Export;
-                    self.apply_defaults();
+                    let stale = self.export_cat.as_ref().is_none_or(|c| !eq_ci(&c.roots.es_root, &self.es_root_path()));
+                    if stale && !self.es_root.trim().is_empty() {
+                        self.start_scan();
+                    } else {
+                        self.apply_defaults();
+                    }
                 }
                 if ui.selectable_label(self.mode == Mode::Deploy, "  Deploy from drive  ").clicked() && self.mode != Mode::Deploy {
                     self.mode = Mode::Deploy;
@@ -621,14 +845,55 @@ impl App {
                         self.apply_defaults();
                     }
                 }
+                if ui.selectable_label(self.mode == Mode::Update, "  Update programs  ").clicked() && self.mode != Mode::Update {
+                    self.mode = Mode::Update;
+                    self.plan = None;
+                    self.progress = None;
+                    if self.upd_root.as_ref().is_none_or(|r| !eq_ci(r, &self.es_root_path())) {
+                        self.load_programs();
+                    }
+                }
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let cog = ui.add(egui::Button::new(RichText::new("⚙").size(20.0)).frame(false)).on_hover_text("Settings");
+                if cog.clicked() {
+                    self.settings_open = !self.settings_open;
+                    if self.settings_open {
+                        self.settings_tab = match self.mode {
+                            Mode::Export => SettingsTab::Export,
+                            Mode::Deploy => SettingsTab::Deploy,
+                            Mode::Update => SettingsTab::Updates,
+                        };
+                    }
+                }
             });
         });
         ui.add_space(6.0);
         ui.add_enabled_ui(!busy, |ui| match self.mode {
             Mode::Export => self.ui_export_paths(ui),
             Mode::Deploy => self.ui_deploy_paths(ui),
+            Mode::Update => self.ui_update_paths(ui),
         });
         ui.add_space(6.0);
+    }
+
+    fn ui_update_paths(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("update_paths").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+            ui.label("ES-DE folder");
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.es_root).desired_width(520.0).hint_text("folder containing ES-DE.exe"));
+                if ui.button("Browse…").clicked() {
+                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                        self.es_root = p.display().to_string();
+                        self.load_programs();
+                    }
+                }
+                if ui.button("Scan").on_hover_text("Look again for installed programs").clicked() {
+                    self.load_programs();
+                }
+            });
+            ui.end_row();
+        });
     }
 
     fn ui_export_paths(&mut self, ui: &mut egui::Ui) {
@@ -688,7 +953,7 @@ impl App {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.pkg_root)
                         .desired_width(520.0)
-                        .hint_text(r"drive or folder holding emuasist\manifest.json"),
+                        .hint_text(r"drive or folder holding EMUAssistant\manifest.json"),
                 );
                 if ui.button("Browse…").clicked() {
                     if let Some(p) = rfd::FileDialog::new().pick_folder() {
@@ -740,6 +1005,7 @@ impl App {
         let p = match self.mode {
             Mode::Export => &self.dest,
             Mode::Deploy => &self.t_es,
+            Mode::Update => &self.es_root,
         };
         volume_root(&normalize(Path::new(p.trim())))
     }
@@ -810,32 +1076,28 @@ impl App {
                 ui.heading("Options");
                 ui.checkbox(&mut self.sel.gamelists, "Gamelists of selected systems");
                 ui.checkbox(&mut self.sel.media, "Scraped media of selected systems");
-                let optional = |kind: &str| -> u64 {
-                    cat.iter()
-                        .flat_map(|c| c.emulators.values())
-                        .filter(|e| self.sel.emulators.contains(&e.id))
-                        .flat_map(|e| &e.optional_dirs)
-                        .filter(|o| o.kind == kind)
-                        .map(|o| o.bytes)
-                        .sum()
-                };
-                let (cheats, thumbs) = (optional("cheats"), optional("thumbnails"));
-                ui.checkbox(&mut self.sel.exclude_cheats, "Skip RetroArch cheats").on_hover_text(format!(
-                    "Leave out RetroArch's cheat database (lots of small files, re-download it from the RetroArch online updater). Saves {}.",
-                    human_bytes(cheats)
-                ));
-                ui.checkbox(&mut self.sel.exclude_thumbnails, "Skip RetroArch thumbnails").on_hover_text(format!(
-                    "Leave out RetroArch's own menu thumbnails (ES-DE doesn't use them, re-download from the online updater). Saves {}.",
-                    human_bytes(thumbs)
-                ));
-                ui.checkbox(&mut self.protect_newer, "Keep newer files at destination").on_hover_text(
-                    "Never overwrite a destination file that is newer than the source, e.g. save games or configs changed on the target machine.",
-                );
                 ui.checkbox(&mut self.prune, "Delete files missing from source").on_hover_text(
                     "Mirror mode for ROMs and scraped media of the selected systems: destination files that no longer exist in the source are deleted. Emulators and ES-DE files are never deleted. You will be asked to confirm.",
                 );
-                ui.checkbox(&mut self.verify, "Verify after copy (slower)")
-                    .on_hover_text("Re-read every copied file and compare it with the source.");
+                let mut active = Vec::new();
+                if self.cfg.protect_newer() {
+                    active.push("newer files at the destination are kept");
+                }
+                if self.cfg.verify() {
+                    active.push("copies are verified");
+                }
+                if self.sel.exclude_cheats || self.sel.exclude_thumbnails {
+                    active.push("RetroArch cheats/thumbnails skipped");
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if !active.is_empty() {
+                        ui.label(RichText::new(format!("Settings: {}.", active.join(", "))).small().weak());
+                    }
+                    if ui.link(RichText::new("Change…").small()).clicked() {
+                        self.settings_open = true;
+                        self.settings_tab = if self.mode == Mode::Deploy { SettingsTab::Deploy } else { SettingsTab::Export };
+                    }
+                });
 
                 let Some(cat) = cat else { return };
                 ui.separator();
@@ -899,7 +1161,7 @@ impl App {
             ui.centered_and_justified(|ui| {
                 ui.label(match self.mode {
                     Mode::Export => "Pick your ES-DE folder and press Scan.",
-                    Mode::Deploy => "Pick the drive holding an EMU Assistant export and press Load.",
+                    Mode::Deploy | Mode::Update => "Pick the drive holding an EMU Assistant export and press Load.",
                 });
             });
             return;
@@ -996,7 +1258,170 @@ impl App {
         });
     }
 
+    fn ui_update_table(&mut self, ui: &mut egui::Ui, busy: bool) {
+        if self.upd_items.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label("Pick your ES-DE folder and press Scan to list the installed programs.");
+            });
+            return;
+        }
+        let targets = self.update_targets();
+        ui.horizontal(|ui| {
+            ui.heading("Programs");
+            ui.label(format!(
+                "{} installed, {} ticked with updates ({} to download)",
+                self.upd_items.len(),
+                targets.len(),
+                human_bytes(targets.iter().map(UpdateItem::download_size).sum())
+            ));
+        });
+        ui.add_enabled_ui(!busy, |ui| {
+            ui.horizontal(|ui| {
+                let with_updates: Vec<String> =
+                    self.upd_items.iter().filter(|i| i.status == Status::Available || !i.cores.is_empty()).map(|i| i.id().to_string()).collect();
+                if ui
+                    .add_enabled(!with_updates.is_empty(), egui::Button::new("Tick all with updates"))
+                    .on_hover_text("Ticks every program with a known newer version (not the ones whose version is unknown)")
+                    .clicked()
+                {
+                    self.cfg.update_selected.extend(with_updates);
+                    config::save(&self.cfg);
+                }
+                if ui.button("Untick all").clicked() {
+                    self.cfg.update_selected.clear();
+                    config::save(&self.cfg);
+                }
+            });
+        });
+        if !self.upd_checked {
+            ui.label(RichText::new("Press Check for updates to look up the latest versions. Only the programs you tick are updated.").weak());
+        }
+        ui.separator();
+
+        let mut toggles: Vec<(String, bool)> = Vec::new();
+        let mut set_source: Option<String> = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            egui::Grid::new("updates").striped(true).num_columns(7).spacing([14.0, 5.0]).show(ui, |ui| {
+                ui.label("");
+                ui.strong("Program");
+                ui.strong("Installed");
+                ui.strong("Latest");
+                ui.strong("Download");
+                ui.strong("Status");
+                ui.strong("Source");
+                ui.end_row();
+                for it in &self.upd_items {
+                    let id = it.id().to_string();
+                    let can = !matches!(it.status, Status::CantUpdate(_));
+                    let mut on = self.cfg.update_selected.contains(&id);
+                    if ui.add_enabled(can && !busy, egui::Checkbox::without_text(&mut on)).changed() {
+                        toggles.push((id.clone(), on));
+                    }
+                    let name = RichText::new(update_label(&id));
+                    ui.label(if can { name } else { name.weak() })
+                        .on_hover_text(format!("{}\n{}", it.program.dir.display(), it.program.exe.display()));
+                    ui.label(&it.installed);
+                    ui.label(it.latest.as_ref().map(|r| r.version.as_str()).unwrap_or("-"))
+                        .on_hover_text(it.latest.as_ref().map(|r| format!("{}\n{}", r.asset_name, r.published)).unwrap_or_default());
+                    let size = it.download_size();
+                    ui.label(if size > 0 { human_bytes(size) } else { String::new() });
+                    ui.vertical(|ui| {
+                        ui.set_min_width(300.0);
+                        let (text, color, tip): (String, Color32, String) = match &it.status {
+                            Status::NotChecked => ("not checked".into(), Color32::GRAY, String::new()),
+                            Status::UpToDate => ("up to date".into(), GOOD, String::new()),
+                            Status::Available => ("update available".into(), WARN, String::new()),
+                            Status::Unknown(s) => (s.clone(), ACCENT, "EMU Assistant can't read this program's version. Tick it to install the latest release; after that its version is known.".into()),
+                            Status::CantUpdate(s) => (shorten(s, 60), Color32::GRAY, s.clone()),
+                            Status::Failed(e) => (shorten(e, 60), BAD, e.clone()),
+                        };
+                        let r = ui.add(egui::Label::new(RichText::new(text).color(color)).extend());
+                        if !tip.is_empty() {
+                            r.on_hover_text(tip);
+                        }
+                        if !it.cores.is_empty() {
+                            ui.label(RichText::new(format!("+ {} cores have newer builds", it.cores.len())).small().color(WARN))
+                                .on_hover_text(it.cores.iter().map(|c| c.file.as_str()).collect::<Vec<_>>().join("\n"));
+                        }
+                        if let Some(n) = &it.cores_note {
+                            ui.label(RichText::new(n).small().color(BAD));
+                        }
+                    });
+                    let custom = self.cfg.update_sources.contains_key(&id);
+                    match &it.source {
+                        Some(s) => {
+                            let text = format!("{}{}", s.describe(), if custom { " (custom)" } else { "" });
+                            if ui.link(RichText::new(shorten(&text, 40)).small()).on_hover_text(format!("{text}\nClick to change")).clicked() {
+                                set_source = Some(id.clone());
+                            }
+                        }
+                        None if !scan::is_program_files(&it.program.dir) => {
+                            if ui.link(RichText::new("Set source…").small()).clicked() {
+                                set_source = Some(id.clone());
+                            }
+                        }
+                        None => {
+                            ui.label("");
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+        for (id, on) in toggles {
+            self.set_update_selected(&id, on);
+        }
+        if let Some(id) = set_source {
+            self.settings_open = true;
+            self.settings_tab = SettingsTab::Sources;
+            self.settings_focus = Some((id, true));
+        }
+    }
+
+    fn ui_update_side(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.add_space(6.0);
+            ui.heading("Update");
+            let targets = self.update_targets();
+            let download: u64 = targets.iter().map(UpdateItem::download_size).sum();
+            ui.label(format!("{} programs ticked with updates", targets.len()));
+            ui.label(format!("Download: {}", human_bytes(download)));
+            free_label(ui, &self.es_root);
+            ui.separator();
+            ui.heading("Safety");
+            if self.cfg.update_backup() {
+                ui.label("Every file an update replaces is saved in a backup zip first.");
+            } else {
+                ui.colored_label(WARN, "Backups are off: replaced files can't be restored.");
+            }
+            ui.label(RichText::new("Settings, saves and configs are never overwritten.").weak());
+            let dir = self.backup_dir();
+            ui.label(RichText::new(format!("Backups: {}", dir.display())).small().weak());
+            ui.horizontal(|ui| {
+                if ui.add_enabled(self.job.is_none(), egui::Button::new("Restore…")).on_hover_text("Roll back an update").clicked() {
+                    self.open_restore();
+                }
+                if ui.button("Settings…").clicked() {
+                    self.settings_open = true;
+                    self.settings_tab = SettingsTab::Updates;
+                }
+            });
+            ui.separator();
+            ui.label(
+                RichText::new(
+                    "Updating here and then exporting brings the new versions to your other machine too. \
+                     Programs installed under Program Files aren't listed; they update with their own installer.",
+                )
+                .small()
+                .weak(),
+            );
+        });
+    }
+
     fn ui_bottom(&mut self, ui: &mut egui::Ui) {
+        if self.mode == Mode::Update {
+            return self.ui_update_bottom(ui);
+        }
         let busy = self.job.is_some();
         let fresh = self.plan_is_fresh();
         let plan = self.plan.as_ref().map(|(_, p)| p.clone());
@@ -1011,7 +1436,7 @@ impl App {
             let can_copy = !busy && fresh && has_work && space_issues.is_empty();
             let label = match self.mode {
                 Mode::Export => "Copy to drive",
-                Mode::Deploy => "Deploy to this machine",
+                Mode::Deploy | Mode::Update => "Deploy to this machine",
             };
             if ui.add_enabled(can_copy, egui::Button::new(RichText::new(label).strong())).clicked() {
                 if self.prune && plan.as_ref().is_some_and(|p| !p.prune.is_empty()) {
@@ -1057,10 +1482,59 @@ impl App {
             }
         }
 
+        self.ui_progress_and_log(ui, busy, "file");
+    }
+
+    fn ui_update_bottom(&mut self, ui: &mut egui::Ui) {
+        let busy = self.job.is_some();
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let can_check = !busy && self.upd_root.is_some() && !self.upd_items.is_empty();
+            if ui
+                .add_enabled(can_check, egui::Button::new("Check for updates"))
+                .on_hover_text("Look up the latest version of every installed program")
+                .clicked()
+            {
+                self.start_check();
+            }
+            let n = self.update_targets().len();
+            let label = if n > 0 { format!("Update selected ({n})") } else { "Update selected".into() };
+            let tip = if !self.upd_checked {
+                "Check for updates first, then tick the programs to update"
+            } else {
+                "Downloads and installs the ticked programs that have updates"
+            };
+            if ui.add_enabled(!busy && n > 0, egui::Button::new(RichText::new(label).strong())).on_hover_text(tip).clicked() {
+                self.start_update();
+            }
+            if ui.add_enabled(!busy, egui::Button::new("Restore…")).on_hover_text("Roll back an update from its backup").clicked() {
+                self.open_restore();
+            }
+            if busy && ui.button("Cancel").clicked() {
+                if let Some(j) = &self.job {
+                    j.cancel();
+                }
+            }
+            ui.label(&self.status);
+        });
+        if let (false, Some((text, ok))) = (busy, &self.upd_result) {
+            let (icon, color) = if *ok { ("✔", GOOD) } else { ("⚠", BAD) };
+            ui.label(RichText::new(format!("{icon} {text}")).strong().color(color));
+        }
+        self.ui_progress_and_log(ui, busy, "program");
+    }
+
+    fn ui_progress_and_log(&mut self, ui: &mut egui::Ui, busy: bool, unit: &str) {
         if let Some(p) = &self.progress {
-            let frac = if p.total_bytes > 0 { p.done_bytes as f32 / p.total_bytes as f32 } else { 1.0 };
+            let frac = if p.total_bytes > 0 {
+                p.done_bytes as f32 / p.total_bytes as f32
+            } else if p.total_files > 0 {
+                p.done_files as f32 / p.total_files as f32
+            } else {
+                1.0
+            };
             let mut text = format!(
-                "{} / {}   file {} of {}",
+                "{} / {}   {unit} {} of {}",
                 human_bytes(p.done_bytes),
                 human_bytes(p.total_bytes),
                 (p.done_files + u64::from(busy)).min(p.total_files),
@@ -1120,12 +1594,332 @@ impl App {
                 });
             });
     }
+
+    fn ui_settings(&mut self, ctx: &egui::Context) {
+        let mut open = self.settings_open;
+        let mut changed = false;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(680.0)
+            .default_height(460.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    for (tab, label) in [
+                        (SettingsTab::General, "General"),
+                        (SettingsTab::Export, "Export"),
+                        (SettingsTab::Deploy, "Deploy"),
+                        (SettingsTab::Updates, "Updates"),
+                        (SettingsTab::Sources, "Update sources"),
+                    ] {
+                        if ui.selectable_label(self.settings_tab == tab, format!(" {label} ")).clicked() {
+                            self.settings_tab = tab;
+                        }
+                    }
+                });
+                ui.separator();
+                let cfg = &mut self.cfg;
+                let mut check = |ui: &mut egui::Ui, value: &mut Option<bool>, default: bool, label: &str, tip: &str| {
+                    let mut v = value.unwrap_or(default);
+                    if ui.checkbox(&mut v, label).on_hover_text(tip).changed() {
+                        *value = Some(v);
+                        changed = true;
+                    }
+                };
+                match self.settings_tab {
+                    SettingsTab::General => {
+                        ui.label(RichText::new("Used by Export and Deploy.").weak());
+                        check(ui, &mut cfg.protect_newer, true, "Keep newer files at destination",
+                            "Never overwrite a destination file that is newer than the source, e.g. save games or configs changed on the target machine.");
+                        check(ui, &mut cfg.verify, false, "Verify after copy (slower)",
+                            "Re-read every copied file and compare it with the source.");
+                    }
+                    SettingsTab::Export => {
+                        check(ui, &mut cfg.exclude_cheats, true, "Skip RetroArch cheats",
+                            "Leave out RetroArch's cheat database (lots of small files, re-download it from the RetroArch online updater).");
+                        check(ui, &mut cfg.exclude_thumbnails, true, "Skip RetroArch thumbnails",
+                            "Leave out RetroArch's own menu thumbnails (ES-DE doesn't use them, re-download from the online updater).");
+                        check(ui, &mut cfg.copy_exe, true, "Copy EMUAssistant.exe to the drive",
+                            "Puts this program on the drive so you can run it on the other machine to deploy.");
+                    }
+                    SettingsTab::Deploy => {
+                        check(ui, &mut cfg.fix_settings, true, "Update ES-DE's ROM and media folders after deploying",
+                            "When the ROM or media folder ends up in a different place than on the main machine, point es_settings.xml at it (the original is kept as es_settings.xml.emuasist-bak).");
+                        check(ui, &mut cfg.exclude_cheats, true, "Skip RetroArch cheats", "Leave out RetroArch's cheat database when deploying.");
+                        check(ui, &mut cfg.exclude_thumbnails, true, "Skip RetroArch thumbnails", "Leave out RetroArch's menu thumbnails when deploying.");
+                    }
+                    SettingsTab::Updates => {
+                        check(ui, &mut cfg.update_backup, true, "Back up replaced files (zip)",
+                            "Before an update overwrites anything, the old files are saved in a zip so the update can be rolled back with Restore.");
+                        check(ui, &mut cfg.update_cores, true, "Update RetroArch cores",
+                            "Also download newer builds of the cores already in RetroArch's cores folder (nightly builds, like RetroArch's online updater).");
+                        ui.horizontal(|ui| {
+                            ui.label("Keep the last");
+                            let mut n = cfg.keep_backups();
+                            if ui.add(egui::DragValue::new(&mut n).range(0..=50)).changed() {
+                                cfg.keep_backups = Some(n);
+                                changed = true;
+                            }
+                            ui.label("backups per program (0 keeps all)");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Backup folder");
+                            let es = normalize(Path::new(self.es_root.trim()));
+                            let mut text = cfg.backup_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                            let hint = config::default_backup_dir(&es).display().to_string();
+                            if ui.add(egui::TextEdit::singleline(&mut text).desired_width(380.0).hint_text(hint)).changed() {
+                                cfg.backup_dir = (!text.trim().is_empty()).then(|| PathBuf::from(text.trim()));
+                                changed = true;
+                            }
+                            if ui.button("Browse…").clicked() {
+                                if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                                    cfg.backup_dir = Some(p);
+                                    changed = true;
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("GitHub token");
+                            let mut t = cfg.github_token.clone().unwrap_or_default();
+                            if ui.add(egui::TextEdit::singleline(&mut t).password(true).desired_width(300.0).hint_text("optional"))
+                                .on_hover_text("Without a token GitHub allows 60 checks an hour. A token without any permissions is enough. The GITHUB_TOKEN environment variable is used instead when set.")
+                                .changed()
+                            {
+                                cfg.github_token = (!t.trim().is_empty()).then(|| t.trim().to_string());
+                                changed = true;
+                            }
+                        });
+                    }
+                    SettingsTab::Sources => {
+                        changed |= Self::ui_sources(ui, cfg, &mut self.upd_items, &mut self.settings_focus);
+                    }
+                }
+                if self.settings_tab != SettingsTab::Sources {
+                    self.settings_focus = None;
+                }
+            });
+        self.settings_open = open;
+        if !open {
+            self.settings_focus = None;
+        }
+        if changed {
+            config::save(&self.cfg);
+        }
+    }
+
+    /// The Update sources tab. Returns true when something changed.
+    /// `focus` = (program to outline, still needs scrolling to).
+    fn ui_sources(ui: &mut egui::Ui, cfg: &mut Config, items: &mut [UpdateItem], focus: &mut Option<(String, bool)>) -> bool {
+        let mut changed = false;
+        ui.label(
+            RichText::new(
+                "Where each installed program's updates come from. Edit a source for an emulator EMU Assistant doesn't know, \
+                 or pick a different build with the file pattern (* matches anything).",
+            )
+            .weak(),
+        );
+        if items.is_empty() {
+            ui.label("Open the Update programs tab and scan your ES-DE folder to list the installed programs.");
+            return false;
+        }
+        let focus_id = focus.as_ref().map(|(id, _)| id.clone());
+        let mut scroll = focus.as_ref().is_some_and(|(_, s)| *s);
+        if let Some((_, s)) = focus.as_mut() {
+            *s = false;
+        }
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for item in items.iter_mut() {
+                let id = item.id().to_string();
+                if scan::is_program_files(&item.program.dir) {
+                    continue;
+                }
+                let builtin = sources::builtin(&id);
+                let custom = cfg.update_sources.contains_key(&id);
+                let mut row_changed = false;
+                let mut spec = cfg.update_sources.get(&id).cloned().or_else(|| builtin.clone()).unwrap_or_default();
+                let before = spec.clone();
+                let frame = egui::Frame::group(ui.style()).stroke(if focus_id.as_deref() == Some(id.as_str()) {
+                    stroke(1.5, ACCENT)
+                } else {
+                    ui.style().visuals.widgets.noninteractive.bg_stroke
+                });
+                let resp = frame.show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.strong(update_label(&id));
+                        ui.label(RichText::new(match (custom, &builtin, &item.source) {
+                            (true, _, _) => "custom",
+                            (false, Some(_), _) => "built-in",
+                            _ => "no source",
+                        }).small().weak());
+                        if custom && ui.small_button(if builtin.is_some() { "Reset to built-in" } else { "Remove" }).clicked() {
+                            cfg.update_sources.remove(&id);
+                            spec = builtin.clone().unwrap_or_default();
+                            row_changed = true;
+                        }
+                    });
+                    egui::Grid::new(format!("src_{id}")).num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                        ui.label("Kind");
+                        egui::ComboBox::from_id_salt(format!("kind_{id}")).selected_text(spec.kind.label()).show_ui(ui, |ui| {
+                            for k in Kind::ALL {
+                                ui.selectable_value(&mut spec.kind, k, k.label());
+                            }
+                        });
+                        ui.end_row();
+                        let (label, hint) = match spec.kind {
+                            Kind::GitHub => ("Repository", "owner/repo"),
+                            Kind::GitLab => ("Project", "group/project"),
+                            Kind::Gitea => ("Repository", "owner/repo"),
+                            Kind::Url => ("Link", "https://…/emulator-windows.zip"),
+                            Kind::Buildbot => ("", ""),
+                        };
+                        if spec.kind == Kind::Gitea {
+                            ui.label("Server");
+                            ui.add(egui::TextEdit::singleline(&mut spec.host).desired_width(360.0).hint_text("git.example.org"));
+                            ui.end_row();
+                        }
+                        if spec.kind != Kind::Buildbot {
+                            ui.label(label);
+                            ui.add(egui::TextEdit::singleline(&mut spec.repo).desired_width(360.0).hint_text(hint));
+                            ui.end_row();
+                        }
+                        if matches!(spec.kind, Kind::GitHub | Kind::GitLab | Kind::Gitea) {
+                            ui.label("File pattern");
+                            ui.add(egui::TextEdit::singleline(&mut spec.asset).desired_width(360.0).hint_text("empty: the Windows x64 zip/7z"))
+                                .on_hover_text("Which download of a release to use, e.g. *windows-x64*.zip");
+                            ui.end_row();
+                        }
+                    });
+                });
+                if scroll && focus_id.as_deref() == Some(id.as_str()) {
+                    resp.response.scroll_to_me(Some(egui::Align::Center));
+                    scroll = false;
+                }
+                if spec != before && !row_changed {
+                    if Some(&spec) == builtin.as_ref() {
+                        cfg.update_sources.remove(&id);
+                    } else {
+                        cfg.update_sources.insert(id.clone(), spec.clone());
+                    }
+                    row_changed = true;
+                }
+                if row_changed {
+                    changed = true;
+                    // the old check result belongs to the old source
+                    item.source = update::source_for(&id, &cfg.update_sources);
+                    item.latest = None;
+                    item.cores.clear();
+                    item.status = match item.source {
+                        Some(_) => Status::NotChecked,
+                        None => Status::CantUpdate("no update source; set one in Settings > Update sources".into()),
+                    };
+                }
+                ui.add_space(4.0);
+            }
+        });
+        changed
+    }
+
+    fn ui_restore(&mut self, ctx: &egui::Context) {
+        let mut open = self.restore_open;
+        let busy = self.job.is_some();
+        let mut start = false;
+        egui::Window::new("Restore from backup")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(640.0)
+            .default_height(420.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Tick a backup to undo that update completely, or expand it and tick single files. \
+                     Restoring puts the old files back and deletes the files the update added.",
+                );
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(self.backup_dir().display().to_string()).small().weak());
+                    if ui.small_button("Open folder").clicked() {
+                        let dir = self.backup_dir();
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::process::Command::new("explorer").arg(dir).spawn();
+                    }
+                });
+                ui.separator();
+                if self.backups.is_empty() {
+                    ui.label("No backups yet. Each update you run creates one.");
+                }
+                egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(300.0).show(ui, |ui| {
+                    for (path, meta) in &self.backups {
+                        let total = meta.replaced.len() + meta.added.len();
+                        let pick = self.restore_picks.entry(path.clone()).or_insert_with(|| RestorePick { files: BTreeSet::new(), expanded: false });
+                        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                        ui.horizontal(|ui| {
+                            let mut all = pick.files.len() == total && total > 0;
+                            let partial = !pick.files.is_empty() && !all;
+                            if ui.add(egui::Checkbox::without_text(&mut all).indeterminate(partial)).changed() {
+                                pick.files = if all {
+                                    meta.replaced.iter().map(|f| f.path.clone()).chain(meta.added.iter().cloned()).collect()
+                                } else {
+                                    BTreeSet::new()
+                                };
+                            }
+                            ui.strong(update_label(&meta.id));
+                            ui.label(format!(
+                                "{} to {}   {}   {} replaced, {} added   {}",
+                                meta.old_version,
+                                meta.new_version,
+                                update::version::date_text(meta.created_unix),
+                                meta.replaced.len(),
+                                meta.added.len(),
+                                human_bytes(size)
+                            ))
+                            .on_hover_text(path.display().to_string());
+                            if ui.small_button(if pick.expanded { "Hide files" } else { "Files…" }).clicked() {
+                                pick.expanded = !pick.expanded;
+                            }
+                        });
+                        if pick.expanded {
+                            ui.indent(path.display().to_string(), |ui| {
+                                for f in meta.replaced.iter().take(2000) {
+                                    let mut on = pick.files.contains(&f.path);
+                                    if ui.checkbox(&mut on, RichText::new(format!("restore  {}", f.path)).small()).changed() {
+                                        toggle(&mut pick.files, &f.path, on);
+                                    }
+                                }
+                                for f in meta.added.iter().take(2000) {
+                                    let mut on = pick.files.contains(f);
+                                    if ui.checkbox(&mut on, RichText::new(format!("delete   {f}")).small().color(WARN)).changed() {
+                                        toggle(&mut pick.files, f, on);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                });
+                ui.separator();
+                let n: usize = self.restore_picks.values().map(|p| p.files.len()).sum();
+                ui.horizontal(|ui| {
+                    let label = format!("Restore {n} files");
+                    if ui.add_enabled(!busy && n > 0, egui::Button::new(RichText::new(label).strong())).clicked() {
+                        start = true;
+                    }
+                    ui.label(RichText::new("Close the programs first; running ones are skipped.").small().weak());
+                });
+            });
+        self.restore_open = open;
+        if start {
+            self.start_restore();
+        }
+    }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_job();
         self.sel.emulators = self.effective_emus();
+        // these two live in the settings now
+        self.sel.exclude_cheats = self.cfg.exclude_cheats.unwrap_or(true);
+        self.sel.exclude_thumbnails = self.cfg.exclude_thumbnails.unwrap_or(true);
         self.cur_fp = self.fingerprint();
         let busy = self.job.is_some();
         if busy {
@@ -1134,13 +1928,28 @@ impl eframe::App for App {
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| self.ui_top(ui, busy));
         egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| self.ui_bottom(ui));
-        egui::SidePanel::right("side")
-            .resizable(true)
-            .default_width(340.0)
-            .show(ctx, |ui| self.ui_side(ui, busy));
-        egui::CentralPanel::default().show(ctx, |ui| self.ui_systems(ui, busy));
+        egui::SidePanel::right("side").resizable(true).default_width(340.0).show(ctx, |ui| {
+            if self.mode == Mode::Update {
+                self.ui_update_side(ui)
+            } else {
+                self.ui_side(ui, busy)
+            }
+        });
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if self.mode == Mode::Update {
+                self.ui_update_table(ui, busy)
+            } else {
+                self.ui_systems(ui, busy)
+            }
+        });
         if self.confirm_prune {
             self.ui_confirm_prune(ctx);
+        }
+        if self.settings_open {
+            self.ui_settings(ctx);
+        }
+        if self.restore_open {
+            self.ui_restore(ctx);
         }
     }
 
@@ -1232,6 +2041,42 @@ fn report_summary(r: &Report) -> String {
     s
 }
 
+fn update_summary(r: &Report, after: After) -> String {
+    let mut s = match after {
+        After::Restored => format!("Restore: put back {} files, removed {} added files", r.copied, r.pruned),
+        _ => format!(
+            "Update: installed {} files, downloaded {} in {}",
+            r.copied,
+            human_bytes(r.copied_bytes),
+            fmt_secs(r.elapsed.as_secs_f64())
+        ),
+    };
+    if r.cancelled {
+        s += " (cancelled)";
+    }
+    if !r.failed.is_empty() {
+        s += &format!(", {} failed (see log)", r.failed.len());
+    }
+    s
+}
+
+/// Display name of an update program id.
+fn update_label(id: &str) -> String {
+    match id {
+        update::ESDE_ID => "ES-DE".into(),
+        "RETROARCH" => "RetroArch".into(),
+        _ => emu_name(id),
+    }
+}
+
+fn shorten(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
+    }
+}
+
 fn fmt_secs(s: f64) -> String {
     let s = s.max(0.0) as u64;
     match s {
@@ -1242,8 +2087,13 @@ fn fmt_secs(s: f64) -> String {
 }
 
 /// Puts this exe on the drive so it can be run on the target machine for deployment.
+/// The copy made under the old name by earlier versions is removed.
 fn copy_self(dest_root: &Path) -> anyhow::Result<Option<PathBuf>> {
     let exe = std::env::current_exe()?;
+    let legacy = dest_root.join(manifest::LEGACY_EXE_NAME);
+    if legacy.is_file() && !eq_ci(&exe, &legacy) {
+        let _ = std::fs::remove_file(&legacy);
+    }
     let target = dest_root.join(manifest::EXE_NAME);
     if eq_ci(&exe, &target) {
         return Ok(None);
