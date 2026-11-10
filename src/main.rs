@@ -5,6 +5,7 @@ mod deploy;
 mod drives;
 mod esde;
 mod fsutil;
+mod games;
 mod gauge;
 mod gauge_geom;
 mod manifest;
@@ -28,13 +29,15 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("--dump") {
         attach_console();
-        let root = args
-            .get(2)
+        let games = args.iter().any(|a| a == "--games");
+        let root = args[2..]
+            .iter()
+            .find(|a| !a.starts_with("--"))
             .map(PathBuf::from)
             .or_else(scan::detect_es_root_near_exe)
-            .context("usage: EMUAssistant --dump <ES-DE folder>")?;
+            .context("usage: EMUAssistant --dump <ES-DE folder> [--games]")?;
         let cat = scan::scan(&root, &AtomicBool::new(false), &mut |s| eprintln!("{s}"))?;
-        scan::print_catalog(&cat);
+        scan::print_catalog(&cat, games);
         return Ok(());
     }
     if args.get(1).map(String::as_str) == Some("--check-updates") {

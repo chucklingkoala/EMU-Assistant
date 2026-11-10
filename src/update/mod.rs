@@ -2,6 +2,7 @@
 //! for newer builds and installs them in place, backing up every file it replaces into
 //! a zip that [`restore_backup`] can put back.
 
+pub mod app;
 pub mod archive;
 pub mod http;
 pub mod sources;
@@ -714,7 +715,7 @@ pub fn print_check(es_root: &Path, opts: &Opts) -> Result<()> {
     let programs = installed_programs(es_root)?;
     let mut items = local_items(programs, &opts.sources);
     check(&mut items, opts, &AtomicBool::new(false), &mut |s| eprintln!("{s}"))?;
-    println!("{:<18} {:<20} {:<20} {}", "Program", "Installed", "Latest", "Status");
+    println!("{:<18} {:<20} {:<20} Status", "Program", "Installed", "Latest");
     for it in &items {
         let status = match &it.status {
             Status::NotChecked => "not checked".to_string(),

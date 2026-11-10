@@ -124,8 +124,8 @@ fn blend_all(dst: &mut RgbaImage, src: &RgbaImage, ox: u32, mask: impl Fn(f32, f
             let s = src.get_pixel(x, y).0;
             let a = s[3] as f32 / 255.0;
             let d = dst.get_pixel_mut(ox + x, y);
-            for c in 0..3 {
-                d.0[c] = (s[c] as f32 * a + d.0[c] as f32 * (1.0 - a)).round() as u8;
+            for (dc, sc) in d.0.iter_mut().zip(s).take(3) {
+                *dc = (sc as f32 * a + *dc as f32 * (1.0 - a)).round() as u8;
             }
         }
     }

@@ -35,6 +35,7 @@ Copies are **incremental and resumable**. Files that are already up to date are 
 ## Features
 
 - **Console picker** listing every ES-DE system that has games, with file count, ROM size, media size and the total space each one needs.
+- **Pick single games** of a system, e.g. only the Switch games you're playing right now. Their updates and DLC from `_Updates` come along automatically.
 - **Automatic emulator detection** using ES-DE's own `es_systems.xml` and `es_find_rules.xml`. It respects the alternative emulators you picked in ES-DE, for a whole system or for individual games.
 - **Fuel-can gauge** showing how full the destination drive will be after the sync, and a warning before you run out of space.
 - **Mirrored paths:** `D:\Games\ROMs\snes` on the main box becomes `E:\Games\ROMs\snes` on the drive.
@@ -47,6 +48,7 @@ Copies are **incremental and resumable**. Files that are already up to date are 
 - **Mirror mode (optional):** deletes ROMs and media at the destination that you've removed at the source. It always asks first.
 - **Program updates:** finds the newest release of ES-DE, RetroArch and the portable emulators you have installed, and updates only the ones you tick. RetroArch cores can be updated too. Settings and saves are never overwritten, and a backup zip lets you undo an update, completely or file by file.
 - **Settings (⚙):** preferences that don't change from run to run live behind the cog in the top right corner and are remembered.
+- **Keeps itself up to date:** tells you when a new EMU Assistant is out and updates itself with one click.
 - **A single small `.exe`** with no installer and no runtime. It remembers your last selection.
 
 ## Requirements
@@ -67,7 +69,7 @@ Download `EMUAssistant.exe` from the [latest release](https://github.com/chuckli
 
 1. **ES-DE folder:** pick the folder that contains `ES-DE.exe`, then press **Scan**. Your ROM and media folders are read from ES-DE's settings, so a custom ROM path is picked up automatically.
 2. **Destination:** pick the external drive with **Drives…**, or browse to a folder.
-3. **Tick the consoles** you want. The **Total** column shows how much space each one needs, and the emulators they use appear on the right.
+3. **Tick the consoles** you want. The **Total** column shows how much space each one needs, and the emulators they use appear on the right. To take only some games of a console, click its **Games** button (see [Choosing games](#choosing-games)).
 4. Press **Analyze**. EMU Assistant compares your setup with the drive:
    - The **To copy** column shows what's missing or changed; *up to date* means nothing needs copying.
    - The status bar shows the totals: files to copy, files already up to date, and newer files at the destination that will be kept.
@@ -83,6 +85,19 @@ E:\
 ├── Emulation\ES-DE\...        ← ES-DE, Emulators\, gamelists, media (same paths as the source)
 └── Games\ROMs\...             ← only the consoles you selected
 ```
+
+#### Choosing games
+
+Click the **Games** button of a system (it shows `50 games`) to open the game picker. Tick the games you want, then press **Done**. The button then shows `12 / 50 games`, and the sizes and the fuel can follow your picks. Your picks are remembered.
+
+- **Updates and DLC come with their game.** Files in a folder such as `_Updates`, `_DLC` or `Updates` are matched to their game by title ID (Switch, Switch 2) or serial (PlayStation, e.g. `CUSA00001-UPDATE`). Files without an ID are matched by name, so `Super Mario Bros Wonder v1.1.0.nsp` goes with `Super Mario Bros. Wonder.nsp`. Hover over *+ 3 updates/DLC* to see which files were matched. A file that matches no game is listed as a game of its own.
+- **Shared folders are always copied.** Other folders starting with `_`, such as `_Firmware` and `_Keys`, go with every selection.
+- **One game, all its files.** A game folder (PS3, Wii U, PS4), a `.cue` sheet with its tracks, or an `.m3u` playlist with its discs counts as one game.
+- **Scraped media** is copied for the picked games only. The gamelist is copied whole.
+- **Unticked games stay on the drive.** Unticking a game only stops it being copied. Games already on the drive are kept, even with *Delete files missing from source* on. To swap games on a small drive, delete the old ones from the drive yourself.
+- **Select all** in the picker goes back to copying every game, including games you add later.
+
+The picker also works in **Deploy** mode, where it lists the games on the drive, so you can put only some of them on the handheld.
 
 Exporting again later only copies what changed. Selecting more consoles adds them to the same drive. Drives exported with an older version (which used `EMU Assistant\` and `EMU Assistant.exe`) are still recognized and are switched to the new names on the next export.
 
@@ -131,6 +146,14 @@ Stable releases are used where a project has them; projects that only publish ro
 
 GitHub allows 60 checks an hour without signing in. If you hit that, add a GitHub token (no permissions needed) under **⚙ Settings > Updates**.
 
+### Updating EMU Assistant itself
+
+EMU Assistant checks GitHub for a newer release each time it starts. When there is one, an **Update to x.y.z** button appears next to the version number in the top right corner. It opens the release notes, and **Update and restart** downloads the new version, swaps it in for the running one and restarts. Only `EMUAssistant.exe` is replaced. The old exe is kept as `EMUAssistant.exe.old` until the new one has started, then removed.
+
+**From the drive to the handheld:** when you run the drive's `EMUAssistant.exe` on another machine and that machine has an older EMU Assistant (the one you last ran there, or the one in its ES-DE folder), it asks whether to replace it with the newer version from the drive.
+
+Turn the startup check off, or check by hand, under **⚙ Settings > General**. Versions up to 0.3.0 can't update themselves, so download 0.4.0 once from the [releases page](https://github.com/chucklingkoala/EMU-Assistant/releases/latest).
+
 ## The fuel can
 
 The **Destination** panel shows how full each target drive will be once the sync completes:
@@ -168,6 +191,7 @@ Preferences that stay the same from run to run are behind the **cog** in the top
 |---|---|---|---|
 | General | Keep newer files at destination | on | Never overwrites a file that is newer at the destination, e.g. saves or configs changed on the handheld. Such files are listed after Analyze. |
 | General | Verify after copy | off | Re-reads every copied file and compares it byte for byte with the source. |
+| General | Check for EMU Assistant updates at startup | on | Looks for a newer release on GitHub when the program starts (see [Updating EMU Assistant itself](#updating-emu-assistant-itself)). |
 | Export / Deploy | Skip RetroArch cheats | on | Leaves out RetroArch's cheat database (tens of thousands of small files). |
 | Export / Deploy | Skip RetroArch thumbnails | on | Leaves out RetroArch's own menu thumbnails. ES-DE doesn't use them. |
 | Export | Copy EMUAssistant.exe to the drive | on | Puts the app on the drive, ready to deploy on the other machine. |
@@ -190,7 +214,7 @@ Preferences that stay the same from run to run are behind the **cog** in the top
 
 | Item | Source | Notes |
 |---|---|---|
-| ROMs | `<ROM folder>\<system>` | Only the consoles you tick. |
+| ROMs | `<ROM folder>\<system>` | Only the consoles you tick, or only the games you pick, with their updates/DLC. |
 | Gamelists | `ES-DE\gamelists\<system>` | Optional. |
 | Scraped media | `ES-DE\downloaded_media\<system>` (or your custom media folder) | Optional, only for selected consoles. |
 | Emulators | The emulator's folder, as found by ES-DE's find rules | The whole folder, so **BIOS files, configs, cores and saves come along**. Shared emulators like RetroArch are copied once. |
@@ -219,7 +243,7 @@ Emulators that live **outside** the ES-DE folder are still copied, to the same p
   ```
   EMUAssistant.exe --dump "D:\Emulation\ES-DE"
   ```
-  This prints the detected ROM and media folders, every system with its emulators, and where each emulator was found.
+  This prints the detected ROM and media folders, every system with its emulators, and where each emulator was found. Add `--games` to also list every game with the updates and DLC matched to it.
 - **Check for updates without the GUI:**
   ```
   EMUAssistant.exe --check-updates "D:\Emulation\ES-DE"
@@ -239,6 +263,8 @@ cargo build --release
 cargo test
 ```
 
+**Releasing a new version:** set `version` in `Cargo.toml` (e.g. `0.5.0`), commit and push, then push a matching tag (`git tag v0.5.0` and `git push origin v0.5.0`). The build workflow checks that the tag matches `Cargo.toml`, builds the exe and publishes the release. Every copy of EMU Assistant offers the update on its next start.
+
 <details>
 <summary>Project layout</summary>
 
@@ -249,13 +275,14 @@ src/
   gauge.rs           fuel-can widget
   gauge_geom.rs      liquid-surface geometry for the can sprites
   scan.rs            reads an ES-DE install into systems / emulators / groups
+  games.rs           splits a system folder into games, matches updates/DLC to them
   esde/              parsers for es_settings, es_systems, es_find_rules, gamelist.xml
   plan.rs            selection -> copy groups -> diff against destination
   sync.rs            copying (atomic .part + rename, mtime, verify, delete)
   manifest.rs        the package description stored on the drive
   deploy.rs          es_settings.xml fix-up on the target
   drives.rs          drive list and free space (Win32)
-  update/            Update mode: sources.rs (where releases come from), http.rs,
+  update/            Update mode: sources.rs (where releases come from), http.rs, app.rs (self-update),
                      archive.rs (zip/7z, backup zips), version.rs (installed versions)
   paths.rs, fsutil.rs, config.rs
 assets/              fuel-can sprites (generated)

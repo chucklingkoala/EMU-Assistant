@@ -23,6 +23,9 @@ pub struct Selection {
     /// Skip RetroArch's cheat database / thumbnails (re-downloadable loose files).
     pub exclude_cheats: bool,
     pub exclude_thumbnails: bool,
+    /// Games picked per system (system -> game keys); systems not listed copy all games.
+    #[serde(default)]
+    pub games: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Selection {
@@ -37,7 +40,7 @@ impl Selection {
 }
 
 /// A directory tree to copy, expressed in original (source machine) paths.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Group {
     pub label: String,
     pub src: PathBuf,
@@ -47,11 +50,19 @@ pub struct Group {
     pub prunable: bool,
     /// The system this group belongs to, for per-system totals.
     pub system: Option<String>,
+    /// Media names (lowercase file names without extension) of games that weren't picked:
+    /// such files are neither copied nor deleted.
+    pub skip_stems: HashSet<String>,
+}
+
+fn skipped_stem(g: &Group, p: &Path) -> bool {
+    !g.skip_stems.is_empty()
+        && p.file_name().is_some_and(|n| g.skip_stems.contains(&crate::games::media_stem(&n.to_string_lossy())))
 }
 
 pub fn groups_for(cat: &Catalog, sel: &Selection) -> Vec<Group> {
     let mut out = Vec::new();
-    let mut push = |label: String, src: &Path, prunable: bool, system: Option<&str>, excludes: Vec<PathBuf>| {
+    let mut push = |label: String, src: &Path, prunable: bool, system: Option<&str>, excludes: Vec<PathBuf>, skip_stems: HashSet<String>| {
         out.push(Group {
             label,
             src: src.to_path_buf(),
@@ -59,22 +70,29 @@ pub fn groups_for(cat: &Catalog, sel: &Selection) -> Vec<Group> {
             recursive: true,
             prunable,
             system: system.map(String::from),
+            skip_stems,
         })
     };
     for s in cat.systems.iter().filter(|s| sel.systems.contains(&s.name)) {
         let sys = Some(s.name.as_str());
-        push(format!("ROMs: {}", s.fullname), &s.rom_dir, true, sys, vec![]);
+        // games that weren't picked stay out of the copy, and are kept if already at the destination
+        let (left_out, stems) = match (sel.games.get(&s.name), &s.games) {
+            (Some(picked), Some(list)) => list.left_out(picked),
+            _ => Default::default(),
+        };
+        let rom_ex = left_out.iter().map(|p| s.rom_dir.join(p)).collect();
+        push(format!("ROMs: {}", s.fullname), &s.rom_dir, true, sys, rom_ex, HashSet::new());
         if let Some(d) = s.gamelist_dir.as_ref().filter(|_| sel.gamelists) {
-            push(format!("Gamelist: {}", s.fullname), d, false, sys, vec![]);
+            push(format!("Gamelist: {}", s.fullname), d, false, sys, vec![], HashSet::new());
         }
         if let Some(d) = s.media_dir.as_ref().filter(|_| sel.media) {
-            push(format!("Media: {}", s.fullname), d, true, sys, vec![]);
+            push(format!("Media: {}", s.fullname), d, true, sys, vec![], stems);
         }
     }
     for e in sel.emulators.iter().filter_map(|id| cat.emulators.get(id)) {
         if let (true, Some(d)) = (e.copyable, &e.dir) {
             let excludes = e.optional_dirs.iter().filter(|o| sel.excludes_kind(&o.kind)).map(|o| o.path.clone()).collect();
-            push(format!("Emulator: {}", e.id), d, false, None, excludes);
+            push(format!("Emulator: {}", e.id), d, false, None, excludes, HashSet::new());
         }
     }
     for g in cat.globals.iter().filter(|g| sel.globals.contains(&g.id)) {
@@ -85,6 +103,7 @@ pub fn groups_for(cat: &Catalog, sel: &Selection) -> Vec<Group> {
             recursive: g.recursive,
             prunable: false,
             system: None,
+            skip_stems: HashSet::new(),
         });
     }
     out
@@ -203,7 +222,7 @@ pub fn build(
                 if g.recursive && dirs_seen.insert(key(&dst)) {
                     plan.dirs.push(dst);
                 }
-            } else if meta.is_file() {
+            } else if meta.is_file() && !skipped_stem(g, p) {
                 items.push((p.to_path_buf(), dst, meta.len(), FileTime::from_last_modification_time(meta)));
             }
         });
@@ -249,7 +268,7 @@ pub fn build(
             let dst_ex: Vec<PathBuf> = g.excludes.iter().map(|e| m.dst(e)).collect();
             let mut errors = Vec::new();
             walk(&dst_root, &dst_ex, g.recursive, &mut errors, |p, meta| {
-                if meta.is_file() && !group_dsts.contains(&key(p)) {
+                if meta.is_file() && !group_dsts.contains(&key(p)) && !skipped_stem(g, p) {
                     plan.prune.push(p.to_path_buf());
                 }
             });
@@ -273,6 +292,7 @@ mod tests {
             gamelists: true,
             exclude_cheats: false,
             exclude_thumbnails: false,
+            games: BTreeMap::new(),
         }
     }
 
@@ -406,11 +426,84 @@ mod tests {
     }
 
     #[test]
+    fn copies_picked_games_and_keeps_the_others() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("main");
+        let roms = src.join(r"ROMs\switch");
+        let media = src.join(r"media\switch");
+        let w = |p: PathBuf| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, p.file_name().unwrap().to_string_lossy().as_bytes()).unwrap();
+        };
+        for f in ["A [0100000000010000][v0].nsp", "B.nsp", r"_Updates\A [0100000000010800][v1].nsp", r"_Updates\B v1.1.nsp", r"_Keys\prod.keys"] {
+            w(roms.join(f));
+        }
+        w(media.join(r"covers\A [0100000000010000][v0].png"));
+        w(media.join(r"covers\B.png"));
+        let sys = |games| crate::scan::SysEntry {
+            name: "switch".into(),
+            fullname: "Switch".into(),
+            rom_dir: roms.clone(),
+            rom_files: 5,
+            rom_bytes: 0,
+            gamelist_dir: None,
+            gamelist_bytes: 0,
+            media_dir: Some(media.clone()),
+            media_bytes: 0,
+            emus_in_use: vec![],
+            emus_alt: vec![],
+            noload: false,
+            games: Some(games),
+        };
+        let roots = Roots { es_root: src.join("ES-DE"), rom_dir: src.join("ROMs"), media_dir: src.join("media") };
+        let cat = Catalog { roots: roots.clone(), systems: vec![sys(crate::games::list(&roms))], ..Default::default() };
+        let pick = |key: &str| Selection {
+            systems: ["switch".to_string()].into(),
+            media: true,
+            games: [("switch".to_string(), [key.to_string()].into())].into(),
+            ..Default::default()
+        };
+        let names = |p: &Plan| {
+            let mut v: Vec<String> = p.copy.iter().map(|i| i.src.file_name().unwrap().to_string_lossy().into_owned()).collect();
+            v.sort();
+            v
+        };
+        let no = AtomicBool::new(false);
+
+        // B is on the drive from an earlier export, Gone.nsp was deleted at the source
+        let drive = tmp.path().join("drive");
+        for f in [roms.join("B.nsp"), media.join(r"covers\B.png"), roms.join("Gone.nsp")] {
+            w(mirror(&drive, &f));
+        }
+        let sel = pick("A [0100000000010000][v0].nsp");
+        let m = Mapper::Export { dest_root: drive.clone() };
+        let p = build(&groups_for(&cat, &sel), &m, &PlanOptions { protect_newer: true, prune: true }, &no, &mut |_| {}).unwrap();
+        assert_eq!(names(&p), vec!["A [0100000000010000][v0].nsp", "A [0100000000010000][v0].png", "A [0100000000010800][v1].nsp", "prod.keys"]);
+        // the unpicked game stays on the drive, even in mirror mode
+        assert_eq!(p.prune.len(), 1, "{:?}", p.prune);
+        assert!(p.prune[0].ends_with("Gone.nsp"));
+        let man = crate::manifest::for_export(None, &cat, &sel);
+        let a = &cat.systems[0].games.as_ref().unwrap();
+        assert_eq!((man.catalog.systems[0].rom_files, man.catalog.systems[0].rom_bytes), a.picked(&sel.games["switch"]));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        assert!(crate::sync::execute(&p, false, &no, &tx).failed.is_empty());
+
+        // deploy only B from the drive (A, its update and _Keys are there too)
+        let pkg = Catalog { systems: vec![sys(crate::games::list(&mirror(&drive, &roms)))], ..cat.clone() };
+        let ally = tmp.path().join("ally");
+        let target = Roots { es_root: ally.join("ES-DE"), rom_dir: ally.join("ROMs"), media_dir: ally.join("media") };
+        let m = Mapper::deploy(&drive, &roots, &target);
+        let p = build(&groups_for(&pkg, &pick("B.nsp")), &m, &PlanOptions { protect_newer: true, prune: false }, &no, &mut |_| {}).unwrap();
+        assert_eq!(names(&p), vec!["B.nsp", "B.png", "prod.keys"]);
+        assert!(p.copy.iter().all(|i| is_under(&i.dst, &ally)));
+    }
+
+    #[test]
     fn rejects_overlap() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("a");
         std::fs::create_dir_all(&src).unwrap();
-        let g = Group { label: "x".into(), src: src.clone(), excludes: vec![], recursive: true, prunable: false, system: None };
+        let g = Group { label: "x".into(), src: src.clone(), recursive: true, ..Default::default() };
         // exporting to the source's own drive root maps every path onto itself
         let m = Mapper::Export { dest_root: PathBuf::from(volume_root(&src).unwrap()) };
         assert!(build(&[g], &m, &PlanOptions { protect_newer: true, prune: false }, &AtomicBool::new(false), &mut |_| {}).is_err());

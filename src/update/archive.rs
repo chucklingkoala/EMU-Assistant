@@ -109,7 +109,7 @@ fn extract_7z(archive: &Path, dest: &Path, cancel: &AtomicBool) -> Result<()> {
 fn seven_zip_exe() -> Option<PathBuf> {
     let installed = ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
         .iter()
-        .filter_map(|v| std::env::var_os(v))
+        .filter_map(std::env::var_os)
         .map(|p| PathBuf::from(p).join(r"7-Zip\7z.exe"));
     let on_path = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).map(|d| d.join("7z.exe")).collect::<Vec<_>>())

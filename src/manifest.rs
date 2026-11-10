@@ -91,6 +91,10 @@ pub fn for_export(existing: Option<Manifest>, cat: &Catalog, sel: &Selection) ->
         let mut s = s.clone();
         let old = base.systems.iter().position(|o| o.name == s.name);
         let prev = old.map(|i| base.systems[i].clone());
+        // only the picked games go to the drive
+        if let (Some(picked), Some(list)) = (sel.games.get(&s.name), &s.games) {
+            (s.rom_files, s.rom_bytes) = list.picked(picked);
+        }
         if !sel.media {
             s.media_dir = prev.as_ref().and_then(|p| p.media_dir.clone());
             s.media_bytes = prev.as_ref().map_or(0, |p| p.media_bytes);

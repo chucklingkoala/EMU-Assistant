@@ -19,6 +19,8 @@ pub struct Config {
     pub emu_override: BTreeMap<String, bool>,
     pub exclude_cheats: Option<bool>,
     pub exclude_thumbnails: Option<bool>,
+    /// Games picked per system (system -> game keys); systems not listed copy all games.
+    pub games: BTreeMap<String, BTreeSet<String>>,
     // settings (unset means the default)
     pub verify: Option<bool>,
     pub protect_newer: Option<bool>,
@@ -33,6 +35,9 @@ pub struct Config {
     pub update_sources: BTreeMap<String, SourceSpec>,
     /// Programs ticked in Update mode.
     pub update_selected: BTreeSet<String>,
+    pub check_app_updates: Option<bool>,
+    /// The EMU Assistant exe installed on this machine (the last one run outside a drive).
+    pub home_exe: Option<PathBuf>,
 }
 
 impl Config {
@@ -56,6 +61,9 @@ impl Config {
     }
     pub fn update_cores(&self) -> bool {
         self.update_cores.unwrap_or(true)
+    }
+    pub fn check_app_updates(&self) -> bool {
+        self.check_app_updates.unwrap_or(true)
     }
     /// The configured backup folder, or `<ES-DE>\EMUAssistant\backups`.
     pub fn backup_dir(&self, es_root: &Path) -> PathBuf {

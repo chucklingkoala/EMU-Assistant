@@ -167,7 +167,7 @@ fn s<'a>(v: &'a Value, key: &str) -> &'a str {
 }
 
 /// A GitHub / Gitea release object -> Release, if it has a matching asset.
-fn from_release(rel: &Value, pattern: &str) -> Option<Release> {
+pub(super) fn from_release(rel: &Value, pattern: &str) -> Option<Release> {
     let assets = rel.get("assets")?.as_array()?;
     let name = pick_asset(assets.iter().map(|a| s(a, "name")), pattern)?;
     let a = assets.iter().find(|a| s(a, "name") == name)?;

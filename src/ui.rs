@@ -16,12 +16,14 @@ use crate::config::{self, Config};
 use crate::deploy;
 use crate::drives::{self, DriveInfo};
 use crate::fsutil::human_bytes;
+use crate::games::{self, GameList};
 use crate::gauge::{self, TankReading, TankTextures, ACCENT};
 use crate::manifest::{self, Manifest};
-use crate::paths::{eq_ci, normalize, volume_root};
+use crate::paths::{eq_ci, mirror, normalize, volume_root};
 use crate::plan::{self, Mapper, Plan, PlanOptions, Selection};
 use crate::scan::{self, Catalog, EmuEntry, Roots};
 use crate::sync::{self, Event, Progress, Report};
+use crate::update::app::{self as app_update, AppRelease, OldCopy};
 use crate::update::archive::BackupMeta;
 use crate::update::sources::{self, Kind};
 use crate::update::{self, Status, UpdateItem};
@@ -121,6 +123,8 @@ enum After {
     Replan,
     Updated,
     Restored,
+    /// EMU Assistant itself was replaced: restart it.
+    AppUpdated,
 }
 
 enum Job {
@@ -165,6 +169,9 @@ pub struct App {
     emu_override: BTreeMap<String, bool>,
     filter: String,
     prune: bool,
+    /// System whose game picker is open, and the picker's filter text.
+    games_open: Option<String>,
+    games_filter: String,
     // update
     upd_items: Vec<UpdateItem>,
     upd_root: Option<PathBuf>,
@@ -179,6 +186,18 @@ pub struct App {
     restore_open: bool,
     backups: Vec<(PathBuf, BackupMeta)>,
     restore_picks: BTreeMap<PathBuf, RestorePick>,
+    // EMU Assistant's own updates
+    app_rx: Option<Receiver<anyhow::Result<Option<AppRelease>>>>,
+    /// A newer release, once a check found one.
+    app_release: Option<AppRelease>,
+    /// Result of the last check for Settings: (text, is an error).
+    app_check_note: Option<(String, bool)>,
+    app_window: bool,
+    app_error: Option<String>,
+    restart: bool,
+    /// Older copies installed on this machine, offered for replacement by the drive's exe.
+    old_copies: Vec<(OldCopy, bool)>,
+    old_copies_dismissed: bool,
     // state
     drives: Vec<DriveInfo>,
     job: Option<Job>,
@@ -213,6 +232,8 @@ impl App {
             emu_override: BTreeMap::new(),
             filter: String::new(),
             prune: false,
+            games_open: None,
+            games_filter: String::new(),
             upd_items: Vec::new(),
             upd_root: None,
             upd_checked: false,
@@ -223,6 +244,14 @@ impl App {
             restore_open: false,
             backups: Vec::new(),
             restore_picks: BTreeMap::new(),
+            app_rx: None,
+            app_release: None,
+            app_check_note: None,
+            app_window: false,
+            app_error: None,
+            restart: false,
+            old_copies: Vec::new(),
+            old_copies_dismissed: false,
             drives: drives::list(),
             job: None,
             status: String::new(),
@@ -237,8 +266,21 @@ impl App {
             icon: gauge::load_png(&cc.egui_ctx, "app_icon", crate::ICON_PNG, Some(64)),
             cfg,
         };
-        let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
-        if let Some(dir) = exe_dir.filter(|d| manifest::exists(d)) {
+        thread::spawn(app_update::cleanup);
+        let exe = std::env::current_exe().ok();
+        let exe_dir = exe.as_ref().and_then(|p| p.parent().map(Path::to_path_buf));
+        let on_drive = exe_dir.as_ref().is_some_and(|d| manifest::exists(d));
+        // remember where this machine keeps EMU Assistant, so a newer one on a drive can update it
+        if let (false, false, Some(exe)) = (cfg!(debug_assertions), on_drive, &exe) {
+            if app.cfg.home_exe.as_ref() != Some(exe) {
+                app.cfg.home_exe = Some(exe.clone());
+                config::save(&app.cfg);
+            }
+        }
+        if !cfg!(debug_assertions) && app.cfg.check_app_updates() {
+            app.start_app_check();
+        }
+        if let Some(dir) = exe_dir.filter(|_| on_drive) {
             // started from a drive that holds an export: deploy
             app.mode = Mode::Deploy;
             app.pkg_root = dir.display().to_string();
@@ -301,6 +343,7 @@ impl App {
         self.plan = None;
         self.report = None;
         self.progress = None;
+        self.games_open = None;
         let Some(cat) = self.cat() else { return };
         let all_globals: BTreeSet<String> = cat.globals.iter().map(|g| g.id.clone()).collect();
         let all_systems = cat.systems.iter().map(|s| s.name.clone());
@@ -318,6 +361,7 @@ impl App {
                     gamelists: self.cfg.gamelists.unwrap_or(true),
                     exclude_cheats: self.cfg.exclude_cheats.unwrap_or(true),
                     exclude_thumbnails: self.cfg.exclude_thumbnails.unwrap_or(true),
+                    games: self.cfg.games.clone(),
                 };
                 self.emu_override = self.cfg.emu_override.clone();
             }
@@ -330,6 +374,7 @@ impl App {
                     gamelists: true,
                     exclude_cheats: self.cfg.exclude_cheats.unwrap_or(true),
                     exclude_thumbnails: self.cfg.exclude_thumbnails.unwrap_or(true),
+                    games: BTreeMap::new(),
                 };
                 self.emu_override.clear();
             }
@@ -365,11 +410,61 @@ impl App {
             .collect()
     }
 
+    /// The game list and picked games of a system whose games are picked one by one.
+    fn picked_games<'a>(&'a self, s: &'a scan::SysEntry) -> Option<(&'a GameList, &'a BTreeSet<String>)> {
+        Some((s.games.as_ref()?, self.sel.games.get(&s.name)?))
+    }
+
+    /// ROM bytes of the picked games, and their share of the system's games (for media).
+    fn rom_bytes(&self, s: &scan::SysEntry) -> (u64, f64) {
+        match self.picked_games(s) {
+            Some((list, picked)) => {
+                let share = list.picked_count(picked) as f64 / list.games.len().max(1) as f64;
+                (list.picked(picked).1, share)
+            }
+            None => (s.rom_bytes, 1.0),
+        }
+    }
+
     /// Space one system needs with the current media / gamelist options.
     fn system_bytes(&self, s: &scan::SysEntry) -> u64 {
-        s.rom_bytes
-            + if self.sel.media { s.media_bytes } else { 0 }
+        let (roms, share) = self.rom_bytes(s);
+        roms + if self.sel.media { (s.media_bytes as f64 * share) as u64 } else { 0 }
             + if self.sel.gamelists { s.gamelist_bytes } else { 0 }
+    }
+
+    /// Opens the game picker, listing the games on the drive first in Deploy mode.
+    fn open_games(&mut self, name: &str) {
+        if self.mode == Mode::Deploy {
+            let pkg = normalize(Path::new(self.pkg_root.trim()));
+            if let Some(cat) = self.deploy_cat.as_mut() {
+                if let Some(s) = Arc::make_mut(cat).systems.iter_mut().find(|s| s.name == name && s.games.is_none()) {
+                    s.games = Some(games::list(&mirror(&pkg, &s.rom_dir)));
+                }
+            }
+        }
+        self.games_filter.clear();
+        self.games_open = Some(name.to_string());
+    }
+
+    /// Applies the picker's ticks: every game means no filter (new games are copied too),
+    /// none unticks the system.
+    fn set_games(&mut self, system: &str, picked: BTreeSet<String>, total: usize) {
+        if picked.is_empty() {
+            self.sel.games.remove(system);
+            self.sel.systems.remove(system);
+        } else {
+            if picked.len() >= total {
+                self.sel.games.remove(system);
+            } else {
+                self.sel.games.insert(system.to_string(), picked);
+            }
+            self.sel.systems.insert(system.to_string());
+        }
+        if self.mode == Mode::Export {
+            self.cfg.games = self.sel.games.clone();
+            config::save(&self.cfg);
+        }
     }
 
     fn selected_bytes(&self, cat: &Catalog) -> u64 {
@@ -424,6 +519,7 @@ impl App {
                 self.deploy_cat = Some(Arc::new(m.catalog.clone()));
                 self.manifest = Some(m);
                 self.apply_defaults();
+                self.find_old_copies();
             }
             Ok(None) => self.status = format!("No EMU Assistant package found in {}", root.display()),
             Err(e) => self.status = format!("Could not read package: {e:#}"),
@@ -500,6 +596,7 @@ impl App {
         self.cfg.emu_override = self.emu_override.clone();
         self.cfg.exclude_cheats = Some(self.sel.exclude_cheats);
         self.cfg.exclude_thumbnails = Some(self.sel.exclude_thumbnails);
+        self.cfg.games = self.sel.games.clone();
         config::save(&self.cfg);
     }
 
@@ -680,6 +777,88 @@ impl App {
         config::save(&self.cfg);
     }
 
+    // ---------- EMU Assistant's own updates ----------
+
+    fn start_app_check(&mut self) {
+        let (tx, rx) = unbounded();
+        let token = self.cfg.github_token();
+        thread::spawn(move || {
+            let _ = tx.send(app_update::check(&update::http::Http::new(token)));
+        });
+        self.app_check_note = Some(("Checking…".into(), false));
+        self.app_rx = Some(rx);
+    }
+
+    fn poll_app_check(&mut self) {
+        let Some(rx) = &self.app_rx else { return };
+        let res = match rx.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(anyhow::anyhow!("the check stopped unexpectedly")),
+        };
+        self.app_rx = None;
+        self.app_check_note = Some(match res {
+            Ok(Some(r)) => {
+                let note = format!("EMU Assistant {} is available", r.version);
+                self.log(note.clone());
+                self.app_release = Some(r);
+                (note, false)
+            }
+            Ok(None) => (format!("You have the latest version ({})", app_update::VERSION), false),
+            Err(e) => {
+                self.log(format!("Could not check for EMU Assistant updates: {e:#}"));
+                (format!("Could not check: {e:#}"), true)
+            }
+        });
+    }
+
+    fn start_app_update(&mut self) {
+        let Some(rel) = self.app_release.clone() else { return };
+        let token = self.cfg.github_token();
+        let (tx, rx) = unbounded();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c = cancel.clone();
+        thread::spawn(move || {
+            let report = app_update::install(&update::http::Http::new(token), &rel, &c, &tx);
+            let _ = tx.send(Event::Done(report));
+        });
+        self.app_error = None;
+        self.begin_copy_job(rx, cancel, After::AppUpdated, "Updating EMU Assistant…");
+    }
+
+    /// Deploy mode: older copies of EMU Assistant on this machine that the drive's exe can replace.
+    fn find_old_copies(&mut self) {
+        if self.mode != Mode::Deploy || self.old_copies_dismissed {
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else { return };
+        let es = normalize(Path::new(self.t_es.trim()));
+        let found = app_update::older_copies(&app_update::candidates(self.cfg.home_exe.as_deref(), &es), &exe, app_update::VERSION);
+        self.old_copies = found.into_iter().map(|c| (c, true)).collect();
+    }
+
+    fn replace_old_copies(&mut self) {
+        let Ok(exe) = std::env::current_exe() else { return };
+        let picked: Vec<PathBuf> = self.old_copies.iter().filter(|(_, on)| *on).map(|(c, _)| c.path.clone()).collect();
+        let mut failed = 0;
+        for p in picked {
+            match app_update::replace(&p, &exe) {
+                Ok(()) => self.log(format!("Updated {} to EMU Assistant {}", p.display(), app_update::VERSION)),
+                Err(e) => {
+                    failed += 1;
+                    self.log(format!("Could not update {}: {e:#}", p.display()));
+                }
+            }
+        }
+        self.status = if failed == 0 {
+            format!("EMU Assistant on this machine updated to {}", app_update::VERSION)
+        } else {
+            "Could not update EMU Assistant on this machine, see the log".into()
+        };
+        self.old_copies.clear();
+        self.old_copies_dismissed = true;
+    }
+
     fn poll_job(&mut self) {
         let Some(job) = self.job.take() else { return };
         self.job = match job {
@@ -778,12 +957,28 @@ impl App {
 
     fn finish_copy(&mut self, r: Report, after: After) {
         match after {
+            After::AppUpdated => {
+                self.progress = None;
+                if r.cancelled {
+                    self.status = "Cancelled".into();
+                } else if let Some(e) = r.failed.first() {
+                    self.log(format!("EMU Assistant update failed: {e}"));
+                    self.status = "EMU Assistant update failed".into();
+                    self.app_error = Some(e.clone());
+                } else {
+                    self.restart = true;
+                }
+            }
             After::Replan => {
                 for f in r.failed.iter().take(200) {
                     self.log(format!("Error: {f}"));
                 }
                 self.log(report_summary(&r));
                 self.plan = None;
+                // a deploy may have put an ES-DE folder (with an older EMU Assistant) in place
+                if !r.cancelled {
+                    self.find_old_copies();
+                }
                 // re-check right away so the gauge and columns show the real state of the destination
                 self.start_plan();
             }
@@ -856,6 +1051,12 @@ impl App {
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let cog = ui.add(egui::Button::new(RichText::new("⚙").size(20.0)).frame(false)).on_hover_text("Settings");
+                if let Some(r) = &self.app_release {
+                    if ui.button(RichText::new(format!("Update to {}", r.version)).color(ACCENT)).on_hover_text("A newer EMU Assistant is available").clicked() {
+                        self.app_window = true;
+                    }
+                }
+                ui.label(RichText::new(format!("v{}", app_update::VERSION)).small().weak());
                 if cog.clicked() {
                     self.settings_open = !self.settings_open;
                     if self.settings_open {
@@ -1204,13 +1405,14 @@ impl App {
         // per-system "to copy" from a fresh Analyze
         let to_copy = self.plan.as_ref().filter(|(fp, _)| *fp == self.cur_fp).map(|(_, p)| p.clone());
         let cols = if to_copy.is_some() { 8 } else { 7 };
+        let mut open_games = None;
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_enabled_ui(!busy, |ui| {
                 egui::Grid::new("systems").striped(true).num_columns(cols).spacing([14.0, 4.0]).show(ui, |ui| {
                     ui.label("");
                     ui.strong("System");
-                    ui.strong("Files");
+                    ui.strong("Games").on_hover_text("Click to pick single games of a system");
                     ui.strong("ROMs");
                     ui.strong("Media");
                     ui.strong("Total").on_hover_text("Space this system needs: ROMs plus media and gamelist when those options are on");
@@ -1225,8 +1427,16 @@ impl App {
                             toggle(&mut self.sel.systems, &s.name, on);
                         }
                         ui.label(&s.fullname).on_hover_text(format!("{}\n{}", s.name, s.rom_dir.display()));
-                        ui.label(s.rom_files.to_string());
-                        ui.label(human_bytes(s.rom_bytes));
+                        let picked = self.picked_games(s);
+                        let text = match (&s.games, picked) {
+                            (_, Some((list, p))) => RichText::new(format!("{} / {} games", list.picked_count(p), list.games.len())).color(ACCENT),
+                            (Some(list), None) => RichText::new(format!("{} games", list.games.len())),
+                            (None, None) => RichText::new(format!("{} files", s.rom_files)),
+                        };
+                        if ui.small_button(text).on_hover_text("Pick which games of this system to copy").clicked() {
+                            open_games = Some(s.name.clone());
+                        }
+                        ui.label(human_bytes(self.rom_bytes(s).0));
                         ui.label(if s.media_dir.is_some() { human_bytes(s.media_bytes + s.gamelist_bytes) } else { "-".into() });
                         let total = RichText::new(human_bytes(self.system_bytes(s))).strong();
                         ui.label(if on { total.color(ACCENT) } else { total });
@@ -1256,6 +1466,99 @@ impl App {
                 });
             });
         });
+        if let Some(name) = open_games {
+            self.open_games(&name);
+        }
+    }
+
+    fn ui_games(&mut self, ctx: &egui::Context) {
+        let Some(name) = self.games_open.clone() else { return };
+        let Some(cat) = self.cat() else {
+            self.games_open = None;
+            return;
+        };
+        let Some((s, list)) = cat.systems.iter().find(|s| s.name == name).and_then(|s| Some((s, s.games.as_ref()?))) else {
+            self.games_open = None;
+            return;
+        };
+        let busy = self.job.is_some();
+        let all: BTreeSet<String> = list.games.iter().map(|g| g.key.clone()).collect();
+        let mut picked = match (self.sel.systems.contains(&name), self.sel.games.get(&name)) {
+            (false, _) => BTreeSet::new(),
+            (true, Some(p)) => p.intersection(&all).cloned().collect(),
+            (true, None) => all.clone(),
+        };
+        let before = picked.clone();
+        let mut open = true;
+        let mut done = false;
+        egui::Window::new(format!("Games: {}", s.fullname))
+            .id(egui::Id::new("games_window"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(760.0)
+            .default_height(520.0)
+            .show(ctx, |ui| {
+                let (_, bytes) = list.picked(&picked);
+                ui.label(format!(
+                    "{} of {} games picked, {} with their updates/DLC and the shared files",
+                    picked.len(),
+                    list.games.len(),
+                    human_bytes(bytes)
+                ));
+                let filter = self.games_filter.to_lowercase();
+                let visible: Vec<_> = list
+                    .games
+                    .iter()
+                    .filter(|g| filter.is_empty() || g.key.to_lowercase().contains(&filter) || g.extras.iter().any(|e| e.to_lowercase().contains(&filter)))
+                    .collect();
+                ui.add_enabled_ui(!busy, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Filter");
+                        ui.add(egui::TextEdit::singleline(&mut self.games_filter).desired_width(220.0));
+                        if ui.button("Select all").on_hover_text("With every game ticked, games added later are copied too").clicked() {
+                            picked.extend(visible.iter().map(|g| g.key.clone()));
+                        }
+                        if ui.button("Select none").clicked() {
+                            for g in &visible {
+                                picked.remove(&g.key);
+                            }
+                        }
+                    });
+                });
+                ui.separator();
+                // leave room for the separator and the Done button below
+                let footer = ui.spacing().interact_size.y + ui.spacing().item_spacing.y * 3.0;
+                egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(ui.available_height() - footer).show(ui, |ui| {
+                    egui::Grid::new("games").striped(true).num_columns(4).spacing([14.0, 4.0]).show(ui, |ui| {
+                        for g in visible {
+                            let mut on = picked.contains(&g.key);
+                            if ui.add_enabled(!busy, egui::Checkbox::without_text(&mut on)).changed() {
+                                toggle(&mut picked, &g.key, on);
+                            }
+                            ui.label(&g.key).on_hover_text(g.paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"));
+                            ui.label(human_bytes(g.bytes));
+                            if g.extras.is_empty() {
+                                ui.label("");
+                            } else {
+                                ui.label(RichText::new(format!("+ {} updates/DLC", g.extras.len())).small().color(ACCENT))
+                                    .on_hover_text(g.extras.join("\n"));
+                            }
+                            ui.end_row();
+                        }
+                    });
+                });
+                ui.separator();
+                if ui.button("Done").clicked() {
+                    done = true;
+                }
+            });
+        if picked != before {
+            self.set_games(&name, picked, all.len());
+        }
+        if !open || done {
+            self.games_open = None;
+        }
     }
 
     fn ui_update_table(&mut self, ui: &mut egui::Ui, busy: bool) {
@@ -1598,6 +1901,7 @@ impl App {
     fn ui_settings(&mut self, ctx: &egui::Context) {
         let mut open = self.settings_open;
         let mut changed = false;
+        let (mut check_now, mut open_app) = (false, false);
         egui::Window::new("Settings")
             .open(&mut open)
             .collapsible(false)
@@ -1634,6 +1938,21 @@ impl App {
                             "Never overwrite a destination file that is newer than the source, e.g. save games or configs changed on the target machine.");
                         check(ui, &mut cfg.verify, false, "Verify after copy (slower)",
                             "Re-read every copied file and compare it with the source.");
+                        ui.separator();
+                        check(ui, &mut cfg.check_app_updates, true, "Check for EMU Assistant updates at startup",
+                            "Looks up the latest EMU Assistant release on GitHub each time the program starts.");
+                        ui.horizontal(|ui| {
+                            ui.label(format!("EMU Assistant {}", app_update::VERSION));
+                            if ui.add_enabled(self.app_rx.is_none(), egui::Button::new("Check now")).clicked() {
+                                check_now = true;
+                            }
+                            if let Some((text, bad)) = &self.app_check_note {
+                                ui.label(RichText::new(text).color(if *bad { BAD } else { Color32::GRAY }));
+                            }
+                            if self.app_release.is_some() && ui.link("Update…").clicked() {
+                                open_app = true;
+                            }
+                        });
                     }
                     SettingsTab::Export => {
                         check(ui, &mut cfg.exclude_cheats, true, "Skip RetroArch cheats",
@@ -1705,6 +2024,12 @@ impl App {
         }
         if changed {
             config::save(&self.cfg);
+        }
+        if check_now {
+            self.start_app_check();
+        }
+        if open_app {
+            self.app_window = true;
         }
     }
 
@@ -1913,9 +2238,107 @@ impl App {
     }
 }
 
+impl App {
+    fn ui_app_update(&mut self, ctx: &egui::Context) {
+        let Some(rel) = self.app_release.clone() else {
+            self.app_window = false;
+            return;
+        };
+        let busy = self.job.is_some();
+        let updating = matches!(self.job, Some(Job::Copy { after: After::AppUpdated, .. }));
+        let (mut open, mut start, mut later) = (true, false, false);
+        egui::Window::new("Update EMU Assistant")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                let date = update::version::parse_ts(&rel.published).map(|t| format!(" ({})", update::version::date_text(t))).unwrap_or_default();
+                ui.label(format!("Installed {}, latest {}{date}", app_update::VERSION, rel.version));
+                if !rel.notes.is_empty() {
+                    ui.separator();
+                    egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                        ui.label(&rel.notes);
+                    });
+                }
+                ui.separator();
+                if let Some(e) = &self.app_error {
+                    ui.colored_label(BAD, e);
+                }
+                if let (true, Some(p)) = (updating, &self.progress) {
+                    let frac = if p.total_bytes > 0 { p.done_bytes as f32 / p.total_bytes as f32 } else { 0.0 };
+                    ui.add(egui::ProgressBar::new(frac).text(format!("{} / {}", human_bytes(p.done_bytes), human_bytes(p.total_bytes))));
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!busy, egui::Button::new(RichText::new("Update and restart").strong()))
+                        .on_disabled_hover_text("Finish or cancel the current task first")
+                        .clicked()
+                    {
+                        start = true;
+                    }
+                    if !rel.page.is_empty() && ui.button("Release page").clicked() {
+                        let _ = std::process::Command::new("explorer").arg(&rel.page).spawn();
+                    }
+                    if ui.button("Later").clicked() {
+                        later = true;
+                    }
+                });
+                ui.label(RichText::new("Only EMUAssistant.exe is replaced. Your settings and ES-DE setup aren't touched.").small().weak());
+            });
+        if start {
+            self.start_app_update();
+        }
+        if !open || later {
+            self.app_window = false;
+        }
+    }
+
+    fn ui_old_copies(&mut self, ctx: &egui::Context) {
+        let busy = self.job.is_some();
+        let (mut replace, mut dismiss) = (false, false);
+        egui::Window::new("Update EMU Assistant on this machine?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("This machine has an older EMU Assistant. Replace it with this version ({})?", app_update::VERSION));
+                for (c, on) in &mut self.old_copies {
+                    let from = c.version.as_deref().unwrap_or("unknown version");
+                    ui.checkbox(on, format!("{}   {from} → {}", c.path.display(), app_update::VERSION));
+                }
+                ui.horizontal(|ui| {
+                    let any = self.old_copies.iter().any(|(_, on)| *on);
+                    if ui.add_enabled(any && !busy, egui::Button::new(RichText::new("Replace").strong())).clicked() {
+                        replace = true;
+                    }
+                    if ui.button("Not now").clicked() {
+                        dismiss = true;
+                    }
+                });
+            });
+        if replace {
+            self.replace_old_copies();
+        } else if dismiss {
+            self.old_copies.clear();
+            self.old_copies_dismissed = true;
+        }
+    }
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_job();
+        self.poll_app_check();
+        if std::mem::take(&mut self.restart) {
+            match std::env::current_exe().map_err(anyhow::Error::from).and_then(|exe| app_update::restart(&exe)) {
+                Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Err(e) => self.app_error = Some(format!("Updated, but could not restart: {e:#}. Start EMU Assistant again.")),
+            }
+        }
+        if self.app_rx.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
         self.sel.emulators = self.effective_emus();
         // these two live in the settings now
         self.sel.exclude_cheats = self.cfg.exclude_cheats.unwrap_or(true);
@@ -1950,6 +2373,15 @@ impl eframe::App for App {
         }
         if self.restore_open {
             self.ui_restore(ctx);
+        }
+        if self.games_open.is_some() {
+            self.ui_games(ctx);
+        }
+        if self.app_window {
+            self.ui_app_update(ctx);
+        }
+        if !self.old_copies.is_empty() {
+            self.ui_old_copies(ctx);
         }
     }
 

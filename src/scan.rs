@@ -9,7 +9,8 @@ use anyhow::{bail, ensure, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::esde::{find_rules, gamelist, settings, systems};
-use crate::fsutil::{dir_size, human_bytes, walk};
+use crate::fsutil::{dir_size, human_bytes};
+use crate::games::{self, GameList};
 use crate::paths::{eq_ci, is_under, normalize};
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -35,6 +36,10 @@ pub struct SysEntry {
     /// Emulators only referenced by alternative commands.
     pub emus_alt: Vec<String>,
     pub noload: bool,
+    /// The system's games for picking them one by one. Not stored in the manifest; Deploy
+    /// lists the games on the drive when needed.
+    #[serde(skip)]
+    pub games: Option<GameList>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -124,7 +129,8 @@ pub fn scan(es_root: &Path, cancel: &AtomicBool, status: &mut dyn FnMut(String))
             continue;
         }
         status(format!("Scanning {}…", def.name));
-        let (rom_files, rom_bytes) = count_games(&dir);
+        let games = games::list(&dir);
+        let (rom_files, rom_bytes) = (games.files, games.bytes);
         if rom_files == 0 {
             continue;
         }
@@ -172,6 +178,7 @@ pub fn scan(es_root: &Path, cancel: &AtomicBool, status: &mut dyn FnMut(String))
             media_dir: media,
             emus_in_use: in_use.into_iter().collect(),
             emus_alt: alt,
+            games: Some(games),
         });
     }
     syslist.sort_by_key(|s| s.fullname.to_lowercase());
@@ -224,23 +231,6 @@ pub fn scan(es_root: &Path, cancel: &AtomicBool, status: &mut dyn FnMut(String))
         globals,
         warnings,
     })
-}
-
-/// Counts game files, ignoring the helper files ES-DE drops into system folders.
-fn count_games(dir: &Path) -> (u64, u64) {
-    let mut files = 0;
-    let mut bytes = 0;
-    let mut errors = Vec::new();
-    walk(dir, &[], true, &mut errors, |p, m| {
-        if m.is_file() {
-            bytes += m.len();
-            let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-            if name != "systeminfo.txt" && name != "noload.txt" {
-                files += 1;
-            }
-        }
-    });
-    (files, bytes)
 }
 
 /// Emulator ids referenced by a launch command. Commands without `%EMULATOR_..%`
@@ -338,7 +328,7 @@ pub fn not_copyable_reason(dir: &Path, es_root: &Path) -> Option<&'static str> {
     if eq_ci(dir, es_root) {
         return Some("lives in the ES-DE folder itself, copied with ES-DE");
     }
-    let windows = ["WINDIR", "SystemRoot"].iter().filter_map(|v| std::env::var_os(v)).map(PathBuf::from);
+    let windows = ["WINDIR", "SystemRoot"].iter().filter_map(std::env::var_os).map(PathBuf::from);
     for w in windows {
         if is_under(dir, &w) {
             return Some("Windows system component, not copied");
@@ -350,11 +340,12 @@ pub fn not_copyable_reason(dir: &Path, es_root: &Path) -> Option<&'static str> {
 pub fn is_program_files(dir: &Path) -> bool {
     ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"]
         .iter()
-        .filter_map(|v| std::env::var_os(v))
+        .filter_map(std::env::var_os)
         .any(|p| is_under(dir, Path::new(&p)))
 }
 
-pub fn print_catalog(cat: &Catalog) {
+/// `games`: also list each system's games with the updates/DLC attached to them.
+pub fn print_catalog(cat: &Catalog, games: bool) {
     let r = &cat.roots;
     println!("ES-DE folder : {}", r.es_root.display());
     println!("ROM folder   : {}", r.rom_dir.display());
@@ -374,6 +365,17 @@ pub fn print_catalog(cat: &Catalog) {
             s.emus_in_use.join(", "),
             if s.emus_alt.is_empty() { String::new() } else { format!("  (alt: {})", s.emus_alt.join(", ")) }
         );
+        if let Some(list) = s.games.as_ref().filter(|_| games) {
+            for g in &list.games {
+                println!("      {:>10}  {}", human_bytes(g.bytes), g.key);
+                for e in &g.extras {
+                    println!("                    + {e}");
+                }
+            }
+            for p in &list.shared {
+                println!("      always copied: {}", p.display());
+            }
+        }
     }
     println!("\nEmulators ({}):", cat.emulators.len());
     for e in cat.emulators.values() {

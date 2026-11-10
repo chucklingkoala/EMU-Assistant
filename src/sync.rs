@@ -194,7 +194,7 @@ mod tests {
     use crate::plan::{build, Group, Mapper, PlanOptions};
 
     fn plan_for(src: &Path, dest: &Path, opts: PlanOptions) -> Plan {
-        let g = Group { label: "t".into(), src: src.to_path_buf(), excludes: vec![], recursive: true, prunable: true, system: None };
+        let g = Group { label: "t".into(), src: src.to_path_buf(), recursive: true, prunable: true, ..Default::default() };
         build(&[g], &Mapper::Export { dest_root: dest.to_path_buf() }, &opts, &AtomicBool::new(false), &mut |_| {}).unwrap()
     }
 
