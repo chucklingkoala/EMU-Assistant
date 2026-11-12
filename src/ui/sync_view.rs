@@ -146,7 +146,7 @@ impl App {
             ui.end_row();
 
             let names: Vec<String> = self.manifest.as_ref().map(|m| m.profiles.keys().cloned().collect()).unwrap_or_default();
-            if !names.is_empty() {
+            if !names.is_empty() && self.mode == Mode::Deploy {
                 ui.label("Profile");
                 let before = self.deploy_profile.clone();
                 egui::ComboBox::from_id_salt("deploy_profile")
@@ -188,7 +188,7 @@ impl App {
     pub(super) fn dest_volume(&self) -> Option<String> {
         let p = match self.mode {
             Mode::Export => &self.dest,
-            Mode::Deploy => &self.t_es,
+            Mode::Deploy | Mode::BringBack => &self.t_es,
             Mode::Update => &self.es_root,
         };
         volume_root(&normalize(Path::new(p.trim())))
@@ -345,7 +345,7 @@ impl App {
             ui.centered_and_justified(|ui| {
                 ui.label(match self.mode {
                     Mode::Export => "Pick your ES-DE folder and press Scan.",
-                    Mode::Deploy | Mode::Update => "Pick the drive holding an EMU Assistant export and press Load.",
+                    Mode::Deploy | Mode::Update | Mode::BringBack => "Pick the drive holding an EMU Assistant export and press Load.",
                 });
             });
             return;
@@ -455,8 +455,10 @@ impl App {
     }
 
     pub(super) fn ui_bottom(&mut self, ui: &mut egui::Ui) {
-        if self.mode == Mode::Update {
-            return self.ui_update_bottom(ui);
+        match self.mode {
+            Mode::Update => return self.ui_update_bottom(ui),
+            Mode::BringBack => return self.ui_bringback_bottom(ui),
+            _ => {}
         }
         let busy = self.job.is_some();
         let fresh = self.plan_is_fresh();
@@ -475,7 +477,7 @@ impl App {
             let can_copy = !busy && fresh && has_work && space_issues.is_empty();
             let label = match self.mode {
                 Mode::Export => "Copy to drive",
-                Mode::Deploy | Mode::Update => "Deploy to this machine",
+                Mode::Deploy | Mode::Update | Mode::BringBack => "Deploy to this machine",
             };
             if ui.add_enabled(can_copy, egui::Button::new(RichText::new(label).strong())).clicked() {
                 if self.prune && plan.as_ref().is_some_and(|p| !p.prune.is_empty()) {
@@ -518,6 +520,9 @@ impl App {
                             }
                         });
                     });
+                if self.mode == Mode::Deploy {
+                    ui.label(RichText::new("Saves made on this machine can be copied back with the Bring back tab.").small().weak());
+                }
             }
         }
 

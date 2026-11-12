@@ -180,9 +180,9 @@ pub struct Plan {
 }
 
 /// FAT/exFAT store modification times with 2 second resolution.
-const MTIME_TOLERANCE_NS: i128 = 2_000_000_000;
+pub(crate) const MTIME_TOLERANCE_NS: i128 = 2_000_000_000;
 
-fn nanos(t: FileTime) -> i128 {
+pub(crate) fn nanos(t: FileTime) -> i128 {
     t.unix_seconds() as i128 * 1_000_000_000 + t.nanoseconds() as i128
 }
 

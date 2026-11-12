@@ -23,7 +23,7 @@ use crate::fsutil::walk;
 use crate::paths::{key, long, normalize};
 use crate::scan;
 use crate::sync::{self, Event, Progress, Report};
-use archive::{BackupMeta, SavedFile};
+use archive::{BackupKind, BackupMeta, SavedFile};
 use http::Http;
 use sources::{Release, SourceSpec, BUILDBOT};
 use version::{cmp_numeric, now_unix, parse_ts, pe_version, read_marker, short_version, Marker};
@@ -404,12 +404,12 @@ fn is_retroarch_id(id: &str) -> bool {
     id == "RETROARCH"
 }
 
-fn safe(s: &str) -> String {
+pub(crate) fn safe(s: &str) -> String {
     let s: String = s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
     if s.is_empty() { "_".into() } else { s }
 }
 
-fn stamp(unix: i64) -> String {
+pub(crate) fn stamp(unix: i64) -> String {
     let secs = unix.rem_euclid(86400);
     format!("{}-{:02}{:02}{:02}", version::date_text(unix).replace('-', ""), secs / 3600, secs % 3600 / 60, secs % 60)
 }
@@ -606,6 +606,7 @@ fn install_one(item: &UpdateItem, ctx: &mut Ctx) -> Result<u64> {
     // 3. backup
     let backup = if ctx.opts.backup {
         let meta = BackupMeta {
+            kind: BackupKind::Update,
             id: id.into(),
             label: id.into(),
             dir: p.dir.clone(),
@@ -631,7 +632,7 @@ fn install_one(item: &UpdateItem, ctx: &mut Ctx) -> Result<u64> {
         })
         .context("writing the backup (nothing was changed)")?;
         ctx.log(format!("{id}: backup saved to {}", out.display()));
-        prune_backups(&ctx.opts.backup_dir, id, ctx.opts.keep);
+        prune_backups(&ctx.opts.backup_dir, id, BackupKind::Update, ctx.opts.keep);
         Some(out)
     } else {
         None
@@ -673,14 +674,15 @@ fn write_marker_for(item: &UpdateItem, main: Option<&Release>) -> Result<()> {
     )
 }
 
-/// Deletes the oldest backups of a program beyond `keep` (0 keeps all).
-fn prune_backups(dir: &Path, id: &str, keep: u32) {
+/// Deletes the oldest backups of a program beyond `keep` (0 keeps all). Update and
+/// saves backups are counted separately, so one kind never pushes out the other.
+pub(crate) fn prune_backups(dir: &Path, id: &str, kind: BackupKind, keep: u32) {
     if keep == 0 {
         return;
     }
     let mut mine: Vec<(i64, PathBuf)> = list_backups(dir)
         .into_iter()
-        .filter(|(_, m)| m.id == id)
+        .filter(|(_, m)| m.id == id && m.kind == kind)
         .map(|(p, m)| (m.created_unix, p))
         .collect();
     mine.sort_by_key(|(t, _)| std::cmp::Reverse(*t));

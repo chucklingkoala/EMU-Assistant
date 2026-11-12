@@ -34,6 +34,23 @@ impl App {
                         self.apply_defaults();
                     }
                 }
+                if ui
+                    .selectable_label(self.mode == Mode::BringBack, "  Bring back  ")
+                    .on_hover_text("Copy saves made on the handheld back to the main machine")
+                    .clicked()
+                    && self.mode != Mode::BringBack
+                {
+                    self.mode = Mode::BringBack;
+                    self.plan = None;
+                    self.progress = None;
+                    self.report = None;
+                    if self.pkg_root.trim().is_empty() {
+                        self.pkg_root = self.dest.clone();
+                    }
+                    if self.deploy_cat.is_none() && !self.pkg_root.trim().is_empty() {
+                        self.load_package();
+                    }
+                }
                 if ui.selectable_label(self.mode == Mode::Update, "  Update programs  ").clicked() && self.mode != Mode::Update {
                     self.mode = Mode::Update;
                     self.plan = None;
@@ -58,6 +75,7 @@ impl App {
                             Mode::Export => SettingsTab::Export,
                             Mode::Deploy => SettingsTab::Deploy,
                             Mode::Update => SettingsTab::Updates,
+                            Mode::BringBack => SettingsTab::General,
                         };
                     }
                 }
@@ -68,6 +86,7 @@ impl App {
             Mode::Export => self.ui_export_paths(ui),
             Mode::Deploy => self.ui_deploy_paths(ui),
             Mode::Update => self.ui_update_paths(ui),
+            Mode::BringBack => self.ui_bringback_paths(ui),
         });
         ui.add_space(6.0);
     }

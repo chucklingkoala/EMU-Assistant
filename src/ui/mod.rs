@@ -1,6 +1,7 @@
 //! egui front-end: Export (ES-DE -> drive), Deploy (drive -> this machine) and
 //! Update (newer ES-DE / emulator builds), plus the Settings and Restore windows.
 
+mod bringback_view;
 mod games_view;
 mod self_update;
 mod settings;
@@ -32,10 +33,12 @@ use crate::plan::{self, Mapper, Plan, PlanOptions, Selection};
 use crate::scan::{self, Catalog, Roots};
 use crate::sync::{self, Event, Progress, Report};
 use crate::update::app::{self as app_update, AppRelease, OldCopy};
-use crate::update::archive::BackupMeta;
+use crate::update::archive::{BackupKind, BackupMeta};
 use crate::update::sources::{self, Kind};
 use crate::update::{self, Status, UpdateItem};
 use crate::APP_NAME;
+use crate::bringback::{self, Direction};
+use crate::paths::key;
 
 use theme::*;
 use widgets::*;
@@ -53,6 +56,7 @@ enum Mode {
     Export,
     Deploy,
     Update,
+    BringBack,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -89,6 +93,8 @@ enum After {
     Restored,
     /// EMU Assistant itself was replaced: restart it.
     AppUpdated,
+    /// Bring back: look for changes again.
+    BroughtBack,
 }
 
 enum Job {
@@ -98,6 +104,8 @@ enum Job {
     Copy { rx: Receiver<Event>, cancel: Arc<AtomicBool>, after: After },
     /// Deploy: listing the games of some systems on the drive; then opens the picker for `open`.
     Games { rx: Receiver<Msg<Vec<(String, GameList)>>>, cancel: Arc<AtomicBool>, open: Option<String> },
+    /// Bring back: comparing the emulator folders.
+    Find { rx: Receiver<Msg<bringback::Found>>, cancel: Arc<AtomicBool> },
 }
 
 impl Job {
@@ -107,7 +115,8 @@ impl Job {
             | Job::Plan { cancel, .. }
             | Job::Check { cancel, .. }
             | Job::Copy { cancel, .. }
-            | Job::Games { cancel, .. } => cancel.store(true, Ordering::Relaxed),
+            | Job::Games { cancel, .. }
+            | Job::Find { cancel, .. } => cancel.store(true, Ordering::Relaxed),
         }
     }
 }
@@ -144,6 +153,13 @@ pub struct App {
     deploy_profile: Option<String>,
     /// Export: a profile name being typed: (the profile being renamed, or None for a new one; text).
     profile_edit: Option<(Option<String>, String)>,
+    // bring back
+    bb_dir: Direction,
+    bb_found: Option<Arc<bringback::Found>>,
+    /// Indices into `bb_found.items`.
+    bb_ticked: BTreeSet<usize>,
+    /// Groups opened or closed by the user, away from their default ("emu" or "emu/Class").
+    bb_toggled: BTreeSet<String>,
     // update
     upd_items: Vec<UpdateItem>,
     upd_root: Option<PathBuf>,
@@ -213,6 +229,10 @@ impl App {
             games_filter: String::new(),
             deploy_profile: None,
             profile_edit: None,
+            bb_dir: Direction::ToDrive,
+            bb_found: None,
+            bb_ticked: BTreeSet::new(),
+            bb_toggled: BTreeSet::new(),
             upd_items: Vec::new(),
             upd_root: None,
             upd_checked: false,
@@ -287,7 +307,7 @@ impl App {
         match self.mode {
             Mode::Export => self.export_cat.clone(),
             Mode::Deploy => self.deploy_cat.clone(),
-            Mode::Update => None,
+            Mode::Update | Mode::BringBack => None,
         }
     }
 
@@ -328,7 +348,7 @@ impl App {
         self.games_open = None;
         let Some(cat) = self.cat() else { return };
         match self.mode {
-            Mode::Update => {}
+            Mode::Update | Mode::BringBack => {}
             Mode::Export => {
                 self.sel = select::export_selection(&cat, &self.cfg);
                 self.emu_override = self.cfg.emu_override.clone();
@@ -519,7 +539,8 @@ impl App {
         self.deploy_cat = None;
         match manifest::load(&root) {
             Ok(Some(m)) => {
-                let r = m.catalog.roots.clone();
+                // where this package went on this machine last time, else the same folders
+                let r = self.cfg.deploy_targets.get(&key(&m.catalog.roots.es_root)).cloned().unwrap_or_else(|| m.catalog.roots.clone());
                 self.t_es = r.es_root.display().to_string();
                 self.t_rom = r.rom_dir.display().to_string();
                 self.t_media = r.media_dir.display().to_string();
@@ -530,6 +551,11 @@ impl App {
                 self.deploy_cat = Some(Arc::new(m.catalog.clone()));
                 // this machine's profile, when the drive has it
                 self.deploy_profile = self.cfg.device_profile.clone().filter(|p| m.profiles.contains_key(p));
+                // on the machine that exported it, saves come from the drive; elsewhere they go to it
+                let here = std::env::var("COMPUTERNAME").unwrap_or_default();
+                self.bb_dir = if !here.is_empty() && m.source_machine.eq_ignore_ascii_case(&here) { Direction::ToMachine } else { Direction::ToDrive };
+                self.bb_found = None;
+                self.bb_ticked.clear();
                 self.manifest = Some(m);
                 self.apply_defaults();
                 self.find_old_copies();
@@ -557,7 +583,7 @@ impl App {
                 }
                 Ok(Mapper::Export { dest_root: dest })
             }
-            Mode::Deploy => {
+            Mode::Deploy | Mode::BringBack => {
                 let cat = self.deploy_cat.as_ref().ok_or_else(|| "Load a package first".to_string())?;
                 let pkg = abs(&self.pkg_root, "Package folder")?;
                 abs(&self.t_es, "Target ES-DE folder")?;
@@ -628,7 +654,7 @@ impl App {
         let c = cancel.clone();
         let verify = self.cfg.verify();
         match self.mode {
-            Mode::Update => return,
+            Mode::Update | Mode::BringBack => return,
             Mode::Export => {
                 let (Some(cat), Ok(Mapper::Export { dest_root })) = (self.export_cat.clone(), self.mapper()) else {
                     return;
@@ -657,8 +683,8 @@ impl App {
                 let fix_settings = self.cfg.fix_settings();
                 if self.manifest.as_ref().is_some_and(|m| !m.profiles.is_empty()) {
                     self.cfg.device_profile = self.deploy_profile.clone();
-                    config::save(&self.cfg);
                 }
+                self.remember_targets();
                 thread::spawn(move || {
                     let _awake = crate::power::KeepAwake::start();
                     let report = sync::execute(&plan, verify, &c, &tx);
@@ -677,6 +703,98 @@ impl App {
             }
         }
         self.begin_copy_job(rx, cancel, After::Replan, "Copying…");
+    }
+
+    /// Remembers this machine's target folders for the loaded package (saves the config).
+    fn remember_targets(&mut self) {
+        if let Some(cat) = &self.deploy_cat {
+            self.cfg.deploy_targets.insert(key(&cat.roots.es_root), self.target_roots());
+        }
+        config::save(&self.cfg);
+    }
+
+    // ---------- bring back ----------
+
+    fn start_find(&mut self) {
+        let Some(cat) = self.deploy_cat.clone() else { return };
+        let mapper = match self.mapper() {
+            Ok(m) => m,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        let dir = self.bb_dir;
+        let (tx, rx) = unbounded();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c = cancel.clone();
+        thread::spawn(move || {
+            let res = bringback::find(&cat, &mapper, dir, &c, &mut |s| {
+                let _ = tx.send(Msg::Status(s));
+            });
+            let _ = tx.send(Msg::Done(res));
+        });
+        self.bb_found = None;
+        self.bb_ticked.clear();
+        self.report = None;
+        self.progress = None;
+        self.status = "Looking for changes…".into();
+        self.job = Some(Job::Find { rx, cancel });
+    }
+
+    fn start_bring_back(&mut self) {
+        let (Some(found), Some(cat), Ok(mapper)) = (self.bb_found.clone(), self.deploy_cat.clone(), self.mapper()) else { return };
+        // emulators running here could be writing the files right now
+        let running: BTreeSet<String> = self
+            .bb_ticked
+            .iter()
+            .filter_map(|&i| found.items.get(i))
+            .map(|i| i.emu.clone())
+            .filter(|id| cat.emulators.get(id).and_then(|e| e.exe.as_ref()).is_some_and(|exe| update::in_use(&mapper.dst(exe))))
+            .collect();
+        for id in &running {
+            self.log(format!("{id} is running; close it and bring its files back again"));
+        }
+        let ticked: Vec<usize> = self.bb_ticked.iter().copied().filter(|&i| found.items.get(i).is_some_and(|it| !running.contains(&it.emu))).collect();
+        if ticked.is_empty() {
+            self.status = if running.is_empty() { "Nothing ticked".into() } else { "Close the running emulators first".into() };
+            return;
+        }
+        let items: Vec<&bringback::Item> = ticked.iter().map(|&i| &found.items[i]).collect();
+        let plan = bringback::to_plan(&items);
+        let mut problems = space_problems(&plan);
+        problems.extend(fat32_problems(&plan, &self.drives));
+        if let Some(p) = problems.first() {
+            self.status = p.clone();
+            return;
+        }
+        self.remember_targets();
+        let (dir, verify) = (self.bb_dir, self.cfg.verify());
+        let (backup_dir, keep) = (self.backup_dir(), self.cfg.keep_backups());
+        let (tx, rx) = unbounded();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c = cancel.clone();
+        thread::spawn(move || {
+            let _awake = crate::power::KeepAwake::start();
+            let items: Vec<&bringback::Item> = ticked.iter().map(|&i| &found.items[i]).collect();
+            // the drive is only a stop on the way; files replaced at home are backed up
+            if dir == Direction::ToMachine {
+                match bringback::backup(&items, &cat, &mapper, &backup_dir, keep, &c) {
+                    Ok(zips) => zips.iter().for_each(|z| {
+                        let _ = tx.send(Event::Log(format!("Backup of the replaced files: {}", z.display())));
+                    }),
+                    Err(e) => {
+                        let why = format!("Could not write the backup, nothing was changed: {e:#}");
+                        let _ = tx.send(Event::Log(why.clone()));
+                        let _ = tx.send(Event::Done(Report { failed: vec![why], ..Default::default() }));
+                        return;
+                    }
+                }
+            }
+            let report = sync::execute(&plan, verify, &c, &tx);
+            let _ = tx.send(Event::Done(report));
+        });
+        self.begin_copy_job(rx, cancel, After::BroughtBack, "Bringing back…");
     }
 
     fn begin_copy_job(&mut self, rx: Receiver<Event>, cancel: Arc<AtomicBool>, after: After, status: &str) {
@@ -754,7 +872,8 @@ impl App {
     }
 
     fn backup_dir(&self) -> PathBuf {
-        self.cfg.backup_dir(&self.es_root_path())
+        let es = if self.mode == Mode::BringBack { self.target_roots().es_root } else { self.es_root_path() };
+        self.cfg.backup_dir(&es)
     }
 
     fn open_restore(&mut self) {
@@ -944,6 +1063,26 @@ impl App {
                     None
                 }
             },
+            Job::Find { rx, cancel } => match drain(&rx, &mut self.status) {
+                None => Some(Job::Find { rx, cancel }),
+                Some(Ok(found)) => {
+                    for w in &found.warnings {
+                        self.log(format!("Warning: {w}"));
+                    }
+                    let saves = found.items.iter().filter(|i| i.class == bringback::Class::Save).count();
+                    self.status = match found.items.len() {
+                        0 => "Nothing new or newer in the emulator folders".into(),
+                        n => format!("{n} new or newer files, {saves} of them saves (ticked)"),
+                    };
+                    self.bb_ticked = found.items.iter().enumerate().filter(|(_, i)| i.class == bringback::Class::Save).map(|(n, _)| n).collect();
+                    self.bb_found = Some(Arc::new(found));
+                    None
+                }
+                Some(Err(e)) => {
+                    self.status = format!("Could not compare: {e:#}");
+                    None
+                }
+            },
             Job::Check { rx, cancel } => match drain(&rx, &mut self.status) {
                 None => Some(Job::Check { rx, cancel }),
                 Some(Ok(items)) => {
@@ -1032,6 +1171,15 @@ impl App {
                     self.start_plan();
                 }
             }
+            After::BroughtBack => {
+                for f in r.failed.iter().take(200) {
+                    self.log(format!("Error: {f}"));
+                }
+                self.log(report_summary(&r));
+                if !self.quit_when_idle {
+                    self.start_find();
+                }
+            }
             After::Updated | After::Restored => {
                 let s = update_summary(&r, after);
                 self.log(s.clone());
@@ -1096,19 +1244,15 @@ impl eframe::App for App {
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| self.ui_top(ui, busy));
         egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| self.ui_bottom(ui));
-        egui::SidePanel::right("side").resizable(true).default_width(340.0).show(ctx, |ui| {
-            if self.mode == Mode::Update {
-                self.ui_update_side(ui)
-            } else {
-                self.ui_side(ui, busy)
-            }
+        egui::SidePanel::right("side").resizable(true).default_width(340.0).show(ctx, |ui| match self.mode {
+            Mode::Update => self.ui_update_side(ui),
+            Mode::BringBack => self.ui_bringback_side(ui, busy),
+            _ => self.ui_side(ui, busy),
         });
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if self.mode == Mode::Update {
-                self.ui_update_table(ui, busy)
-            } else {
-                self.ui_systems(ui, busy)
-            }
+        egui::CentralPanel::default().show(ctx, |ui| match self.mode {
+            Mode::Update => self.ui_update_table(ui, busy),
+            Mode::BringBack => self.ui_bringback_list(ui, busy),
+            _ => self.ui_systems(ui, busy),
         });
         if self.confirm_prune {
             self.ui_confirm_prune(ctx);

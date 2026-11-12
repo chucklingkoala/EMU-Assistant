@@ -233,8 +233,8 @@ impl App {
             .default_height(420.0)
             .show(ctx, |ui| {
                 ui.label(
-                    "Tick a backup to undo that update completely, or expand it and tick single files. \
-                     Restoring puts the old files back and deletes the files the update added.",
+                    "Tick a backup to undo that update or bring-back completely, or expand it and tick single files. \
+                     Restoring puts the old files back and deletes the files that were added.",
                 );
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(self.backup_dir().display().to_string()).small().weak());
@@ -264,10 +264,16 @@ impl App {
                                 };
                             }
                             ui.strong(update_label(&meta.id));
+                            let what = match meta.kind {
+                                BackupKind::Saves => "saves brought back".to_string(),
+                                BackupKind::Update => format!("{} to {}", meta.old_version, meta.new_version),
+                            };
+                            let (replaced, added) = match meta.kind {
+                                BackupKind::Saves => ("older saves", "new"),
+                                BackupKind::Update => ("replaced", "added"),
+                            };
                             ui.label(format!(
-                                "{} to {}   {}   {} replaced, {} added   {}",
-                                meta.old_version,
-                                meta.new_version,
+                                "{what}   {}   {} {replaced}, {} {added}   {}",
                                 update::version::date_text(meta.created_unix),
                                 meta.replaced.len(),
                                 meta.added.len(),

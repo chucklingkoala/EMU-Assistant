@@ -44,6 +44,9 @@ pub struct Config {
     pub active_profile: Option<String>,
     /// On a target machine: the profile last deployed here.
     pub device_profile: Option<String>,
+    /// On a target machine: where the folders of a package went, by the lowercase ES-DE
+    /// folder of the main machine, so relocated folders needn't be typed again.
+    pub deploy_targets: BTreeMap<String, crate::scan::Roots>,
 }
 
 /// What a profile remembers: the Export selection and the destination.

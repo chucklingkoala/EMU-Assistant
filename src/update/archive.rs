@@ -140,10 +140,22 @@ pub struct SavedFile {
     pub mtime: i64,
 }
 
+/// What made a backup.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackupKind {
+    /// A program update; the zip holds the files it replaced.
+    #[default]
+    Update,
+    /// Saves brought back from the drive; the zip holds the saves they replaced.
+    Saves,
+}
+
 /// `backup.json` inside each backup zip.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default)]
 pub struct BackupMeta {
+    /// Missing in backups made before 0.6, which are all updates.
+    pub kind: BackupKind,
     pub id: String,
     pub label: String,
     pub dir: PathBuf,
@@ -281,8 +293,8 @@ pub fn restore(zip_path: &Path, only: Option<&BTreeSet<String>>, cancel: &Atomic
             Err(e) => res.failed.push(format!("delete {rel}: {e}")),
         }
     }
-    // a full restore also brings back the old version record
-    if only.is_none() {
+    // a full restore of an update also brings back the old version record
+    if only.is_none() && meta.kind == BackupKind::Update {
         let marker = meta.dir.join(super::version::MARKER);
         match &meta.old_marker {
             Some(m) => super::version::write_marker(&meta.dir, m)?,
@@ -372,6 +384,31 @@ pub(crate) mod tests {
         assert_eq!((r.restored, r.removed, r.failed.len()), (2, 1, 0));
         assert_eq!(fs::read(dir.join(r"sub\b.dat")).unwrap(), b"old b");
         assert!(!dir.join("new").exists());
+    }
+
+    #[test]
+    fn restoring_saves_keeps_the_version_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("emu");
+        fs::create_dir_all(dir.join("saves")).unwrap();
+        fs::write(dir.join(r"saves\a.srm"), b"main").unwrap();
+        let marker = super::super::version::Marker { version: "1.0".into(), ..Default::default() };
+        super::super::version::write_marker(&dir, &marker).unwrap();
+        let meta = BackupMeta {
+            kind: BackupKind::Saves,
+            dir: dir.clone(),
+            replaced: vec![SavedFile { path: r"saves\a.srm".into(), mtime: 1_000_000 }],
+            ..Default::default()
+        };
+        let zip = tmp.path().join("saves.zip");
+        write_backup(&zip, &meta, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        fs::write(dir.join(r"saves\a.srm"), b"handheld").unwrap();
+        restore(&zip, None, &AtomicBool::new(false)).unwrap();
+        assert_eq!(fs::read(dir.join(r"saves\a.srm")).unwrap(), b"main");
+        assert!(super::super::version::read_marker(&dir).is_some());
+        // a zip written before the kind existed reads as an update
+        let old: BackupMeta = serde_json::from_str(r#"{"id":"X"}"#).unwrap();
+        assert_eq!(old.kind, BackupKind::Update);
     }
 
     #[test]

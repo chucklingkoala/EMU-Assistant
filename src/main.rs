@@ -1,10 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod bringback;
 mod config;
 mod deploy;
 mod drives;
-mod export;
 mod esde;
+mod export;
 mod fsutil;
 mod games;
 mod gauge;
