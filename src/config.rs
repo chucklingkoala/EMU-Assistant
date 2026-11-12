@@ -38,6 +38,25 @@ pub struct Config {
     pub check_app_updates: Option<bool>,
     /// The EMU Assistant exe installed on this machine (the last one run outside a drive).
     pub home_exe: Option<PathBuf>,
+    /// Named Export selections, one per target device. The selection fields above are the
+    /// working copy of the active one.
+    pub profiles: BTreeMap<String, Profile>,
+    pub active_profile: Option<String>,
+    /// On a target machine: the profile last deployed here.
+    pub device_profile: Option<String>,
+}
+
+/// What a profile remembers: the Export selection and the destination.
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct Profile {
+    pub dest: Option<PathBuf>,
+    pub systems: BTreeSet<String>,
+    pub globals: Option<BTreeSet<String>>,
+    pub media: Option<bool>,
+    pub gamelists: Option<bool>,
+    pub emu_override: BTreeMap<String, bool>,
+    pub games: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Config {
@@ -79,6 +98,48 @@ impl Config {
             sources: self.update_sources.clone(),
         }
     }
+    /// The working selection as a profile.
+    pub fn snapshot(&self) -> Profile {
+        Profile {
+            dest: self.dest.clone(),
+            systems: self.systems.clone(),
+            globals: self.globals.clone(),
+            media: self.media,
+            gamelists: self.gamelists,
+            emu_override: self.emu_override.clone(),
+            games: self.games.clone(),
+        }
+    }
+
+    /// Makes `p` the working selection.
+    pub fn apply(&mut self, p: &Profile) {
+        self.dest = p.dest.clone();
+        self.systems = p.systems.clone();
+        self.globals = p.globals.clone();
+        self.media = p.media;
+        self.gamelists = p.gamelists;
+        self.emu_override = p.emu_override.clone();
+        self.games = p.games.clone();
+    }
+
+    /// Stores the working selection under the active profile, then makes `name` active and
+    /// loads its selection. `None` (or an unknown name) detaches: the selection stays as it is.
+    pub fn switch_profile(&mut self, name: Option<&str>) {
+        self.store_active();
+        let next = name.and_then(|n| self.profiles.get(n).cloned());
+        if let Some(p) = &next {
+            self.apply(p);
+        }
+        self.active_profile = next.and(name.map(String::from));
+    }
+
+    /// Saves the working selection under the active profile, if there is one.
+    pub fn store_active(&mut self) {
+        if let Some(name) = self.active_profile.clone() {
+            self.profiles.insert(name, self.snapshot());
+        }
+    }
+
     /// `GITHUB_TOKEN` wins over the token saved in the settings.
     pub fn github_token(&self) -> Option<String> {
         std::env::var("GITHUB_TOKEN").ok().or_else(|| self.github_token.clone()).filter(|t| !t.trim().is_empty())
@@ -115,5 +176,41 @@ pub fn save(cfg: &Config) {
     let tmp = p.with_extension("json.tmp");
     if std::fs::write(&tmp, s).is_ok() {
         let _ = std::fs::rename(&tmp, &p);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profiles_switch_and_keep_their_selection() {
+        let mut c = Config { systems: ["snes".to_string()].into(), dest: Some(PathBuf::from(r"E:\")), ..Default::default() };
+        // the first profile is the current selection
+        c.profiles.insert("Ally".into(), c.snapshot());
+        c.active_profile = Some("Ally".into());
+        c.profiles.insert("Legion".into(), Profile { systems: ["psx".to_string()].into(), dest: Some(PathBuf::from(r"F:\")), ..Default::default() });
+
+        // a change while Ally is active stays with Ally
+        c.media = Some(false);
+        c.switch_profile(Some("Legion"));
+        assert_eq!(c.systems, ["psx".to_string()].into());
+        assert_eq!(c.dest, Some(PathBuf::from(r"F:\")));
+        assert_eq!(c.media, None);
+        assert_eq!(c.active_profile.as_deref(), Some("Legion"));
+
+        c.switch_profile(Some("Ally"));
+        assert_eq!(c.systems, ["snes".to_string()].into());
+        assert_eq!(c.media, Some(false));
+
+        // detaching keeps the selection; unknown names detach too
+        c.switch_profile(None);
+        assert_eq!((c.active_profile.as_deref(), c.systems.len()), (None, 1));
+        c.switch_profile(Some("nope"));
+        assert_eq!(c.active_profile, None);
+
+        // a config from before profiles still loads
+        let old: Config = serde_json::from_str(r#"{"systems":["snes"],"dest":"E:\\"}"#).unwrap();
+        assert!(old.profiles.is_empty() && old.active_profile.is_none());
     }
 }

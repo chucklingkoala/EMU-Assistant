@@ -1,5 +1,6 @@
 //! `<drive>\EMUAssistant\manifest.json`: what was exported, from where. Deploy mode reads it.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,6 +28,9 @@ pub struct Manifest {
     /// False while an export is running or after it was cancelled / had errors.
     pub complete: bool,
     pub catalog: Catalog,
+    /// Selections exported under a profile name, so Deploy can pre-tick one device's part.
+    #[serde(default)]
+    pub profiles: BTreeMap<String, Selection>,
 }
 
 pub fn path(root: &Path) -> PathBuf {
@@ -79,11 +83,15 @@ fn now() -> u64 {
 
 /// Merges this export's selection into the manifest already on the drive (if it came
 /// from the same ES-DE folder), so repeated exports of different systems accumulate.
-pub fn for_export(existing: Option<Manifest>, cat: &Catalog, sel: &Selection) -> Manifest {
-    let mut base = match existing {
-        Some(m) if eq_ci(&m.catalog.roots.es_root, &cat.roots.es_root) => m.catalog,
-        _ => Catalog::default(),
+/// With a `profile`, the selection is recorded under that name too.
+pub fn for_export(existing: Option<Manifest>, cat: &Catalog, sel: &Selection, profile: Option<&str>) -> Manifest {
+    let (mut base, mut profiles) = match existing {
+        Some(m) if eq_ci(&m.catalog.roots.es_root, &cat.roots.es_root) => (m.catalog, m.profiles),
+        _ => (Catalog::default(), BTreeMap::new()),
     };
+    if let Some(name) = profile {
+        profiles.insert(name.to_string(), sel.clone());
+    }
     base.roots = cat.roots.clone();
     base.warnings.clear();
 
@@ -126,6 +134,7 @@ pub fn for_export(existing: Option<Manifest>, cat: &Catalog, sel: &Selection) ->
         updated_unix: now(),
         complete: false,
         catalog: base,
+        profiles,
     }
 }
 
@@ -152,27 +161,41 @@ mod tests {
         let mut sel = Selection { media: true, gamelists: true, ..Default::default() };
         sel.systems.insert("snes".into());
         sel.emulators.insert("RETROARCH".into());
-        let m1 = for_export(None, &cat, &sel);
+        let m1 = for_export(None, &cat, &sel, Some("Ally"));
         assert_eq!(m1.catalog.systems.len(), 1);
 
         let mut sel2 = Selection::default();
         sel2.systems.insert("psx".into());
         sel2.systems.insert("snes".into());
-        let m2 = for_export(Some(m1), &cat, &sel2);
+        let m2 = for_export(Some(m1), &cat, &sel2, Some("Legion"));
         assert_eq!(m2.catalog.systems.len(), 2);
         // media exported earlier stays recorded even though this export skipped media
         let snes = m2.catalog.systems.iter().find(|s| s.name == "snes").unwrap();
         assert!(snes.media_dir.is_some());
         assert!(m2.catalog.emulators.contains_key("RETROARCH"));
 
+        // both devices' selections are on the drive
+        assert_eq!(m2.profiles.keys().collect::<Vec<_>>(), ["Ally", "Legion"]);
+        assert_eq!(m2.profiles["Ally"].systems, ["snes".to_string()].into());
+        assert!(m2.profiles["Ally"].emulators.contains("RETROARCH"));
+        assert_eq!(m2.profiles["Legion"].systems.len(), 2);
+        // an export without a profile leaves them alone
+        let m3 = for_export(Some(m2.clone()), &cat, &sel2, None);
+        assert_eq!(m3.profiles.len(), 2);
+
         save(tmp.path(), &m2).unwrap();
-        assert_eq!(load(tmp.path()).unwrap().unwrap().catalog.systems.len(), 2);
+        let back = load(tmp.path()).unwrap().unwrap();
+        assert_eq!((back.catalog.systems.len(), back.profiles.len()), (2, 2));
+        // a manifest written before profiles still reads
+        let mut old: serde_json::Value = serde_json::to_value(&back).unwrap();
+        old.as_object_mut().unwrap().remove("profiles");
+        assert!(serde_json::from_value::<Manifest>(old).unwrap().profiles.is_empty());
     }
 
     #[test]
     fn reads_pre_rename_location() {
         let tmp = tempfile::tempdir().unwrap();
-        let m = for_export(None, &Catalog::default(), &Selection::default());
+        let m = for_export(None, &Catalog::default(), &Selection::default(), None);
         for legacy in LEGACY_DIRS {
             let root = tmp.path().join(legacy.replace(' ', "_"));
             let dir = root.join(legacy);

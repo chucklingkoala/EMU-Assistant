@@ -431,7 +431,7 @@ mod tests {
         std::fs::create_dir_all(&drive).unwrap();
         let p = build(&groups_for(&cat, &sel), &Mapper::Export { dest_root: drive.clone() }, &opts, &no, &mut |_| {}).unwrap();
         assert!(crate::sync::execute(&p, true, &no, &tx).failed.is_empty());
-        let m = crate::manifest::for_export(None, &cat, &sel);
+        let m = crate::manifest::for_export(None, &cat, &sel, None);
         crate::manifest::save(&drive, &m).unwrap();
 
         // deploy on the "ally" with ES-DE and ROMs in different places
@@ -522,7 +522,7 @@ mod tests {
         // the unpicked game stays on the drive, even in mirror mode
         assert_eq!(p.prune.len(), 1, "{:?}", p.prune);
         assert!(p.prune[0].ends_with("Gone.nsp"));
-        let man = crate::manifest::for_export(None, &cat, &sel);
+        let man = crate::manifest::for_export(None, &cat, &sel, None);
         let a = &cat.systems[0].games.as_ref().unwrap();
         assert_eq!((man.catalog.systems[0].rom_files, man.catalog.systems[0].rom_bytes), a.picked(&sel.games["switch"]));
         let (tx, _rx) = crossbeam_channel::unbounded();

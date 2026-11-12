@@ -43,6 +43,25 @@ pub fn deploy_selection(cat: &Catalog, cfg: &Config) -> Selection {
     }
 }
 
+/// Deploy with a profile recorded on the drive: what was exported for that device,
+/// limited to what the drive has. Returns the selection and the emulator overrides that
+/// tick exactly the profile's emulators.
+pub fn deploy_profile_selection(cat: &Catalog, cfg: &Config, p: &Selection) -> (Selection, BTreeMap<String, bool>) {
+    let systems: BTreeSet<String> = cat.systems.iter().map(|s| s.name.clone()).filter(|s| p.systems.contains(s)).collect();
+    let sel = Selection {
+        games: p.games.iter().filter(|(s, _)| systems.contains(*s)).map(|(s, g)| (s.clone(), g.clone())).collect(),
+        systems,
+        emulators: BTreeSet::new(),
+        globals: cat.globals.iter().map(|g| g.id.clone()).filter(|g| p.globals.contains(g)).collect(),
+        media: p.media,
+        gamelists: p.gamelists,
+        exclude_cheats: cfg.exclude_cheats.unwrap_or(true),
+        exclude_thumbnails: cfg.exclude_thumbnails.unwrap_or(true),
+    };
+    let overrides = cat.emulators.keys().map(|id| (id.clone(), p.emulators.contains(id))).collect();
+    (sel, overrides)
+}
+
 /// Emulators referenced by the selected systems: id -> (used by default/override, system names).
 pub fn relevant_emus(cat: &Catalog, sel: &Selection) -> BTreeMap<String, (bool, Vec<String>)> {
     let mut m: BTreeMap<String, (bool, Vec<String>)> = BTreeMap::new();
@@ -210,6 +229,28 @@ mod tests {
         let all = deploy_selection(&cat, &cfg);
         assert_eq!(all.systems.len(), cat.systems.len());
         assert_eq!(all.globals.len(), cat.globals.len());
+    }
+
+    #[test]
+    fn deploy_profile_ticks_that_devices_part() {
+        let (_tmp, cat) = cat();
+        let profile = Selection {
+            systems: ["snes".to_string(), "not_on_drive".to_string()].into(),
+            emulators: ["BSNES".to_string()].into(),
+            globals: ["themes".to_string()].into(),
+            media: false,
+            gamelists: true,
+            games: [("snes".to_string(), ["a.sfc".to_string()].into()), ("not_on_drive".to_string(), BTreeSet::new())].into(),
+            ..Default::default()
+        };
+        let (sel, ov) = deploy_profile_selection(&cat, &Config::default(), &profile);
+        assert_eq!(sel.systems, ["snes".to_string()].into());
+        assert_eq!(sel.games.keys().collect::<Vec<_>>(), ["snes"]);
+        assert!(!sel.media && sel.gamelists);
+        assert!(sel.globals.iter().all(|g| g == "themes"));
+        // only the profile's emulators go along, even though RetroArch is in use for snes
+        let emus = effective_emus(&cat, &sel, &ov);
+        assert_eq!(emus, ["BSNES".to_string()].into());
     }
 
     #[test]

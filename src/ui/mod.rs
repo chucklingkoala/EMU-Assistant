@@ -70,6 +70,16 @@ enum Msg<T> {
     Done(anyhow::Result<T>),
 }
 
+/// Buttons of the Export profile row.
+enum ProfileAction {
+    Switch(Option<String>),
+    StartNew,
+    StartRename,
+    Delete,
+    Commit,
+    Cancel,
+}
+
 /// What a finished copy-style job was, to decide what happens next.
 #[derive(Clone, Copy)]
 enum After {
@@ -130,6 +140,10 @@ pub struct App {
     /// System whose game picker is open, and the picker's filter text.
     games_open: Option<String>,
     games_filter: String,
+    /// Deploy: the profile on the drive whose selection is ticked (None: everything).
+    deploy_profile: Option<String>,
+    /// Export: a profile name being typed: (the profile being renamed, or None for a new one; text).
+    profile_edit: Option<(Option<String>, String)>,
     // update
     upd_items: Vec<UpdateItem>,
     upd_root: Option<PathBuf>,
@@ -197,6 +211,8 @@ impl App {
             prune: false,
             games_open: None,
             games_filter: String::new(),
+            deploy_profile: None,
+            profile_edit: None,
             upd_items: Vec::new(),
             upd_root: None,
             upd_checked: false,
@@ -318,8 +334,79 @@ impl App {
                 self.emu_override = self.cfg.emu_override.clone();
             }
             Mode::Deploy => {
-                self.sel = select::deploy_selection(&cat, &self.cfg);
-                self.emu_override.clear();
+                let profile = self.deploy_profile.as_ref().and_then(|n| self.manifest.as_ref()?.profiles.get(n)).cloned();
+                match profile {
+                    Some(p) => (self.sel, self.emu_override) = select::deploy_profile_selection(&cat, &self.cfg, &p),
+                    None => {
+                        self.sel = select::deploy_selection(&cat, &self.cfg);
+                        self.emu_override.clear();
+                    }
+                }
+                // picked games need the drive's game lists
+                if self.job.is_none() {
+                    let picked: Vec<String> = self.sel.games.keys().cloned().collect();
+                    self.start_list_games(&picked, None);
+                }
+            }
+        }
+    }
+
+    /// Export: copies what is on screen into the config's working selection. Only after a
+    /// scan, when the selection is the real one.
+    fn capture_selection(&mut self) {
+        if self.mode != Mode::Export || self.export_cat.is_none() {
+            return;
+        }
+        let dest = normalize(Path::new(self.dest.trim()));
+        self.cfg.dest = (!dest.as_os_str().is_empty()).then_some(dest);
+        self.cfg.systems = self.sel.systems.clone();
+        self.cfg.globals = Some(self.sel.globals.clone());
+        self.cfg.media = Some(self.sel.media);
+        self.cfg.gamelists = Some(self.sel.gamelists);
+        self.cfg.emu_override = self.emu_override.clone();
+        self.cfg.games = self.sel.games.clone();
+    }
+
+    fn profile_action(&mut self, a: ProfileAction) {
+        match a {
+            ProfileAction::Switch(name) => {
+                self.capture_selection();
+                self.cfg.switch_profile(name.as_deref());
+                if let Some(d) = &self.cfg.dest {
+                    self.dest = d.display().to_string();
+                }
+                config::save(&self.cfg);
+                self.apply_defaults();
+            }
+            ProfileAction::StartNew => self.profile_edit = Some((None, String::new())),
+            ProfileAction::StartRename => self.profile_edit = self.cfg.active_profile.clone().map(|n| (Some(n.clone()), n)),
+            ProfileAction::Delete => {
+                if let Some(n) = self.cfg.active_profile.take() {
+                    self.cfg.profiles.remove(&n);
+                    config::save(&self.cfg);
+                }
+            }
+            ProfileAction::Cancel => self.profile_edit = None,
+            ProfileAction::Commit => {
+                let Some((old, text)) = self.profile_edit.take() else { return };
+                let name = text.trim().to_string();
+                match old {
+                    None => {
+                        self.capture_selection();
+                        self.cfg.store_active();
+                        self.cfg.profiles.insert(name.clone(), self.cfg.snapshot());
+                        self.cfg.active_profile = Some(name);
+                    }
+                    Some(old) => {
+                        if let Some(p) = self.cfg.profiles.remove(&old) {
+                            self.cfg.profiles.insert(name.clone(), p);
+                        }
+                        if self.cfg.active_profile.as_deref() == Some(old.as_str()) {
+                            self.cfg.active_profile = Some(name);
+                        }
+                    }
+                }
+                config::save(&self.cfg);
             }
         }
     }
@@ -441,6 +528,8 @@ impl App {
                     self.log("Warning: the last export to this drive did not finish cleanly. Missing files are reported during Analyze.");
                 }
                 self.deploy_cat = Some(Arc::new(m.catalog.clone()));
+                // this machine's profile, when the drive has it
+                self.deploy_profile = self.cfg.device_profile.clone().filter(|p| m.profiles.contains_key(p));
                 self.manifest = Some(m);
                 self.apply_defaults();
                 self.find_old_copies();
@@ -488,6 +577,20 @@ impl App {
                 return;
             }
         };
+        // a picked game list that isn't read yet would copy every game of the system
+        let unlisted: Vec<String> = cat
+            .systems
+            .iter()
+            .filter(|s| s.games.is_none() && self.sel.systems.contains(&s.name) && self.sel.games.contains_key(&s.name))
+            .map(|s| s.name.clone())
+            .collect();
+        if !unlisted.is_empty() {
+            if self.job.is_none() {
+                self.start_list_games(&unlisted, None);
+            }
+            self.status = "Reading the picked games on the drive first; press Analyze again when that is done.".into();
+            return;
+        }
         let groups = plan::groups_for(&cat, &self.sel);
         if groups.is_empty() {
             self.status = "Nothing selected".into();
@@ -511,16 +614,10 @@ impl App {
     }
 
     fn remember_export(&mut self, dest: &Path) {
+        self.capture_selection();
         self.cfg.es_root = Some(normalize(Path::new(self.es_root.trim())));
         self.cfg.dest = Some(dest.to_path_buf());
-        self.cfg.systems = self.sel.systems.clone();
-        self.cfg.globals = Some(self.sel.globals.clone());
-        self.cfg.media = Some(self.sel.media);
-        self.cfg.gamelists = Some(self.sel.gamelists);
-        self.cfg.emu_override = self.emu_override.clone();
-        self.cfg.exclude_cheats = Some(self.sel.exclude_cheats);
-        self.cfg.exclude_thumbnails = Some(self.sel.exclude_thumbnails);
-        self.cfg.games = self.sel.games.clone();
+        self.cfg.store_active();
         config::save(&self.cfg);
     }
 
@@ -538,10 +635,19 @@ impl App {
                 };
                 let sel = self.sel.clone();
                 let copy_exe = self.cfg.copy_exe();
+                let profile = self.cfg.active_profile.clone();
                 self.remember_export(&dest_root);
                 thread::spawn(move || {
                     let _awake = crate::power::KeepAwake::start();
-                    let job = crate::export::Job { cat: &cat, sel: &sel, plan: &plan, dest_root: &dest_root, verify, copy_exe };
+                    let job = crate::export::Job {
+                        cat: &cat,
+                        sel: &sel,
+                        plan: &plan,
+                        dest_root: &dest_root,
+                        profile: profile.as_deref(),
+                        verify,
+                        copy_exe,
+                    };
                     let report = crate::export::run(&job, &c, &tx);
                     let _ = tx.send(Event::Done(report));
                 });
@@ -549,6 +655,10 @@ impl App {
             Mode::Deploy => {
                 let target = self.target_roots();
                 let fix_settings = self.cfg.fix_settings();
+                if self.manifest.as_ref().is_some_and(|m| !m.profiles.is_empty()) {
+                    self.cfg.device_profile = self.deploy_profile.clone();
+                    config::save(&self.cfg);
+                }
                 thread::spawn(move || {
                     let _awake = crate::power::KeepAwake::start();
                     let report = sync::execute(&plan, verify, &c, &tx);

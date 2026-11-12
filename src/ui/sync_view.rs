@@ -4,7 +4,57 @@ use super::*;
 
 impl App {
     pub(super) fn ui_export_paths(&mut self, ui: &mut egui::Ui) {
+        let mut action = None;
         egui::Grid::new("export_paths").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+            ui.label("Profile").on_hover_text("A named selection and destination, e.g. one per handheld");
+            ui.horizontal(|ui| {
+                if let Some((old, text)) = &mut self.profile_edit {
+                    let r = ui.add(egui::TextEdit::singleline(text).desired_width(220.0).hint_text("e.g. ROG Ally"));
+                    r.request_focus();
+                    let name = text.trim().to_string();
+                    let taken = self.cfg.profiles.contains_key(&name) && old.as_deref() != Some(name.as_str());
+                    let ok = !name.is_empty() && !taken;
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.add_enabled(ok, egui::Button::new(if old.is_some() { "Rename" } else { "Save" })).clicked() || (ok && enter) {
+                        action = Some(ProfileAction::Commit);
+                    }
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        action = Some(ProfileAction::Cancel);
+                    }
+                    if taken {
+                        ui.colored_label(WARN, "a profile with this name exists");
+                    }
+                } else {
+                    let active = self.cfg.active_profile.clone();
+                    egui::ComboBox::from_id_salt("profile")
+                        .width(220.0)
+                        .selected_text(active.as_deref().unwrap_or("(none)"))
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(active.is_none(), "(none)").clicked() && active.is_some() {
+                                action = Some(ProfileAction::Switch(None));
+                            }
+                            for name in self.cfg.profiles.keys() {
+                                let on = active.as_deref() == Some(name.as_str());
+                                if ui.selectable_label(on, name).clicked() && !on {
+                                    action = Some(ProfileAction::Switch(Some(name.clone())));
+                                }
+                            }
+                        });
+                    if ui.button("New…").on_hover_text("Save the current selection and destination under a name").clicked() {
+                        action = Some(ProfileAction::StartNew);
+                    }
+                    if active.is_some() {
+                        if ui.button("Rename…").clicked() {
+                            action = Some(ProfileAction::StartRename);
+                        }
+                        if ui.button("Delete").on_hover_text("Forget this profile; the current selection stays").clicked() {
+                            action = Some(ProfileAction::Delete);
+                        }
+                    }
+                }
+            });
+            ui.end_row();
+
             ui.label("ES-DE folder");
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.es_root).desired_width(520.0).hint_text("folder containing ES-DE.exe"));
@@ -50,10 +100,14 @@ impl App {
             });
             ui.end_row();
         });
+        if let Some(a) = action {
+            self.profile_action(a);
+        }
     }
 
     pub(super) fn ui_deploy_paths(&mut self, ui: &mut egui::Ui) {
         let orig = self.deploy_cat.as_ref().map(|c| c.roots.clone());
+        let mut profile_changed = false;
         egui::Grid::new("deploy_paths").num_columns(3).spacing([10.0, 6.0]).show(ui, |ui| {
             ui.label("Package (drive)");
             ui.horizontal(|ui| {
@@ -91,6 +145,26 @@ impl App {
             }
             ui.end_row();
 
+            let names: Vec<String> = self.manifest.as_ref().map(|m| m.profiles.keys().cloned().collect()).unwrap_or_default();
+            if !names.is_empty() {
+                ui.label("Profile");
+                let before = self.deploy_profile.clone();
+                egui::ComboBox::from_id_salt("deploy_profile")
+                    .width(220.0)
+                    .selected_text(self.deploy_profile.as_deref().unwrap_or("Everything on the drive"))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.deploy_profile, None, "Everything on the drive");
+                        for n in names {
+                            ui.selectable_value(&mut self.deploy_profile, Some(n.clone()), n);
+                        }
+                    });
+                ui.label(RichText::new("ticks what was exported for that device").weak());
+                ui.end_row();
+                if self.deploy_profile != before {
+                    profile_changed = true;
+                }
+            }
+
             if let Some(orig) = &orig {
                 let old = self.t_es.clone();
                 path_row(ui, "Target ES-DE folder", &mut self.t_es, &orig.es_root);
@@ -106,6 +180,9 @@ impl App {
                 path_row(ui, "Target media folder", &mut self.t_media, &orig.media_dir);
             }
         });
+        if profile_changed {
+            self.apply_defaults();
+        }
     }
 
     pub(super) fn dest_volume(&self) -> Option<String> {

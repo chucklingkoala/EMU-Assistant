@@ -18,6 +18,8 @@ pub struct Job<'a> {
     pub sel: &'a Selection,
     pub plan: &'a Plan,
     pub dest_root: &'a Path,
+    /// The profile this export belongs to, recorded in the manifest.
+    pub profile: Option<&'a str>,
     pub verify: bool,
     pub copy_exe: bool,
 }
@@ -32,7 +34,7 @@ pub fn run(job: &Job, cancel: &AtomicBool, tx: &Sender<Event>) -> Report {
         log(format!("Ignoring unreadable manifest: {e:#}"));
         None
     });
-    let mut m = manifest::for_export(existing, job.cat, job.sel);
+    let mut m = manifest::for_export(existing, job.cat, job.sel, job.profile);
     if let Err(e) = manifest::save(job.dest_root, &m) {
         log(format!("Could not write manifest: {e:#}"));
     }
