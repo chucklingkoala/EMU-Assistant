@@ -625,6 +625,7 @@ impl App {
                 let copy_exe = self.cfg.copy_exe();
                 self.remember_export(&dest_root);
                 thread::spawn(move || {
+                    let _awake = crate::power::KeepAwake::start();
                     let log = |s: String| {
                         let _ = tx.send(Event::Log(s));
                     };
@@ -655,6 +656,7 @@ impl App {
                 let target = self.target_roots();
                 let fix_settings = self.cfg.fix_settings();
                 thread::spawn(move || {
+                    let _awake = crate::power::KeepAwake::start();
                     let report = sync::execute(&plan, verify, &c, &tx);
                     if !report.cancelled && fix_settings {
                         match deploy::fix_settings(&target) {
@@ -740,6 +742,7 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let c = cancel.clone();
         thread::spawn(move || {
+            let _awake = crate::power::KeepAwake::start();
             let report = update::install(&items, &opts, &c, &tx);
             let _ = tx.send(Event::Done(report));
         });
@@ -774,6 +777,7 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let c = cancel.clone();
         thread::spawn(move || {
+            let _awake = crate::power::KeepAwake::start();
             let report = update::restore_backups(&jobs, &c, &tx);
             let _ = tx.send(Event::Done(report));
         });

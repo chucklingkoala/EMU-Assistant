@@ -11,6 +11,7 @@ mod gauge_geom;
 mod manifest;
 mod paths;
 mod plan;
+mod power;
 mod scan;
 mod sync;
 mod ui;
