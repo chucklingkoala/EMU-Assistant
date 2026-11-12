@@ -209,6 +209,11 @@ pub struct App {
     report: Option<Report>,
     log: Vec<String>,
     confirm_prune: bool,
+    confirm_close: bool,
+    /// Quit as soon as the cancelled job has stopped.
+    quit_when_idle: bool,
+    /// A job just finished: flash the taskbar button if the window isn't in front.
+    attention: bool,
     tank: TankTextures,
     icon: egui::TextureHandle,
 }
@@ -262,6 +267,9 @@ impl App {
             report: None,
             log: Vec::new(),
             confirm_prune: false,
+            confirm_close: false,
+            quit_when_idle: false,
+            attention: false,
             tank: TankTextures::load(&cc.egui_ctx),
             icon: gauge::load_png(&cc.egui_ctx, "app_icon", crate::ICON_PNG, Some(64)),
             cfg,
@@ -981,7 +989,9 @@ impl App {
                     self.find_old_copies();
                 }
                 // re-check right away so the gauge and columns show the real state of the destination
-                self.start_plan();
+                if !self.quit_when_idle {
+                    self.start_plan();
+                }
             }
             After::Updated | After::Restored => {
                 let s = update_summary(&r, after);
@@ -1004,6 +1014,9 @@ impl App {
                     self.open_restore();
                 }
             }
+        }
+        if !matches!(after, After::AppUpdated) {
+            self.attention = true;
         }
         self.report = Some(r);
     }
@@ -1904,6 +1917,33 @@ impl App {
             });
     }
 
+    fn ui_confirm_close(&mut self, ctx: &egui::Context) {
+        if self.job.is_none() {
+            self.confirm_close = false;
+            return;
+        }
+        egui::Window::new("A task is still running")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("Quitting now cancels it. A copy can be continued later: files that were already copied are kept.");
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Cancel the task and quit").color(BAD)).clicked() {
+                        if let Some(j) = &self.job {
+                            j.cancel();
+                        }
+                        self.quit_when_idle = true;
+                        self.confirm_close = false;
+                        self.status = "Stopping…".into();
+                    }
+                    if ui.button("Keep running").clicked() {
+                        self.confirm_close = false;
+                    }
+                });
+            });
+    }
+
     fn ui_settings(&mut self, ctx: &egui::Context) {
         let mut open = self.settings_open;
         let mut changed = false;
@@ -2336,6 +2376,16 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_job();
         self.poll_app_check();
+        if ctx.input(|i| i.viewport().close_requested()) && self.job.is_some() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm_close = true;
+        }
+        if self.quit_when_idle && self.job.is_none() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if std::mem::take(&mut self.attention) && !ctx.input(|i| i.focused) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
+        }
         if std::mem::take(&mut self.restart) {
             match std::env::current_exe().map_err(anyhow::Error::from).and_then(|exe| app_update::restart(&exe)) {
                 Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
@@ -2388,6 +2438,9 @@ impl eframe::App for App {
         }
         if !self.old_copies.is_empty() {
             self.ui_old_copies(ctx);
+        }
+        if self.confirm_close {
+            self.ui_confirm_close(ctx);
         }
     }
 
