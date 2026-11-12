@@ -298,3 +298,7 @@ build.rs             embeds Icon/EMU Assistant.png as the exe icon
 Created by [ChucklingKoala](https://github.com/chucklingkoala), developed together with [Claude](https://claude.com/claude-code) (Anthropic).
 
 Built for [ES-DE (EmulationStation Desktop Edition)](https://es-de.org). EMU Assistant is an independent tool and is not affiliated with the ES-DE project.
+
+## License
+
+EMU Assistant is released under the [MIT License](LICENSE).
