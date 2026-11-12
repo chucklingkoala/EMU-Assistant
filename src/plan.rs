@@ -167,8 +167,13 @@ pub struct Plan {
     /// Destination files newer than the source, left alone.
     pub protected: Vec<PathBuf>,
     pub prune: Vec<PathBuf>,
+    /// Destination folders of the groups that have files in `prune`; emptied folders
+    /// below them are removed after the files.
+    pub prune_roots: Vec<PathBuf>,
     pub dirs: Vec<PathBuf>,
     pub bytes_by_volume: BTreeMap<String, u64>,
+    /// Size of the largest file to copy per destination volume (FAT32 can't hold 4 GiB).
+    pub largest_file_by_volume: BTreeMap<String, u64>,
     /// Bytes still to copy per system (ROMs + gamelist + media).
     pub copy_bytes_by_system: BTreeMap<String, u64>,
     pub warnings: Vec<String>,
@@ -226,37 +231,64 @@ pub fn build(
                 items.push((p.to_path_buf(), dst, meta.len(), FileTime::from_last_modification_time(meta)));
             }
         });
+        let src_complete = errors.is_empty();
         plan.warnings.extend(errors.into_iter().map(|e| format!("{}: {e}", g.label)));
+
+        // One listing of the destination instead of one metadata call per source file.
+        // lowercase path -> (path as it is on disk, size, modification time)
+        let mut dst_files: HashMap<String, (PathBuf, u64, FileTime)> = HashMap::new();
+        let mut dst_complete = true;
+        if dst_root.is_dir() {
+            let dst_ex: Vec<PathBuf> = g.excludes.iter().map(|e| m.dst(e)).collect();
+            let mut dst_errors = Vec::new();
+            walk(&dst_root, &dst_ex, g.recursive, &mut dst_errors, |p, meta| {
+                if meta.is_file() {
+                    dst_files.insert(key(p), (p.to_path_buf(), meta.len(), FileTime::from_last_modification_time(meta)));
+                }
+            });
+            dst_complete = dst_errors.is_empty();
+        }
 
         for (src, dst, size, mtime) in items {
             if cancel.load(Ordering::Relaxed) {
                 bail!("cancelled");
             }
             let (dk, sk) = (key(&dst), key(&src));
+            // Record the file for this group first: a file that an earlier, overlapping
+            // group already planned still exists in the source and must not be pruned.
+            group_dsts.insert(dk.clone());
             match seen.get(&dk) {
                 Some(prev) if *prev == sk => continue,
                 Some(prev) => bail!("Two source files map to {}: {prev} and {sk}", dst.display()),
                 None => {}
             }
             seen.insert(dk.clone(), sk);
-            group_dsts.insert(dk);
 
-            match std::fs::metadata(long(&dst)) {
-                Ok(dm) if dm.is_file() => {
-                    let diff = nanos(FileTime::from_last_modification_time(&dm)) - nanos(mtime);
-                    if dm.len() == size && diff.abs() <= MTIME_TOLERANCE_NS {
-                        plan.skipped += 1;
-                        plan.skipped_bytes += size;
-                        continue;
-                    }
-                    if opts.protect_newer && diff > MTIME_TOLERANCE_NS {
-                        plan.protected.push(dst);
-                        continue;
-                    }
+            let existing = match dst_files.get(&dk) {
+                Some((_, len, t)) => Some((*len, *t)),
+                // the listing was incomplete: ask for this one file directly
+                None if !dst_complete => std::fs::metadata(long(&dst))
+                    .ok()
+                    .filter(|dm| dm.is_file())
+                    .map(|dm| (dm.len(), FileTime::from_last_modification_time(&dm))),
+                None => None,
+            };
+            if let Some((len, dst_mtime)) = existing {
+                let diff = nanos(dst_mtime) - nanos(mtime);
+                if len == size && diff.abs() <= MTIME_TOLERANCE_NS {
+                    plan.skipped += 1;
+                    plan.skipped_bytes += size;
+                    continue;
                 }
-                _ => {}
+                if opts.protect_newer && diff > MTIME_TOLERANCE_NS {
+                    plan.protected.push(dst);
+                    continue;
+                }
             }
-            *plan.bytes_by_volume.entry(volume_root(&dst).unwrap_or_default()).or_default() += size;
+            let vol = volume_root(&dst).unwrap_or_default();
+            *plan.bytes_by_volume.entry(vol.clone()).or_default() += size;
+            let largest = plan.largest_file_by_volume.entry(vol).or_default();
+            *largest = (*largest).max(size);
             if let Some(sys) = &g.system {
                 *plan.copy_bytes_by_system.entry(sys.clone()).or_default() += size;
             }
@@ -264,14 +296,22 @@ pub fn build(
             plan.copy.push(PlanItem { src, dst, size, mtime });
         }
 
-        if opts.prune && g.prunable && dst_root.is_dir() {
-            let dst_ex: Vec<PathBuf> = g.excludes.iter().map(|e| m.dst(e)).collect();
-            let mut errors = Vec::new();
-            walk(&dst_root, &dst_ex, g.recursive, &mut errors, |p, meta| {
-                if meta.is_file() && !group_dsts.contains(&key(p)) && !skipped_stem(g, p) {
-                    plan.prune.push(p.to_path_buf());
+        if opts.prune && g.prunable {
+            if !src_complete {
+                // unreadable source files would look deleted
+                plan.warnings.push(format!("{}: the source could not be read completely, so nothing is deleted here", g.label));
+            } else {
+                let mut extra: Vec<PathBuf> = dst_files
+                    .iter()
+                    .filter(|(k, v)| !group_dsts.contains(*k) && !skipped_stem(g, &v.0))
+                    .map(|(_, v)| v.0.clone())
+                    .collect();
+                extra.sort();
+                if !extra.is_empty() {
+                    plan.prune_roots.push(dst_root.clone());
+                    plan.prune.extend(extra);
                 }
-            });
+            }
         }
     }
     Ok(plan)
@@ -507,5 +547,30 @@ mod tests {
         // exporting to the source's own drive root maps every path onto itself
         let m = Mapper::Export { dest_root: PathBuf::from(volume_root(&src).unwrap()) };
         assert!(build(&[g], &m, &PlanOptions { protect_newer: true, prune: false }, &AtomicBool::new(false), &mut |_| {}).is_err());
+    }
+
+    #[test]
+    fn overlapping_groups_do_not_prune_each_others_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.bin"), b"a").unwrap();
+        let dest = tmp.path().join("drive");
+        let m = Mapper::Export { dest_root: dest };
+        let group = |label: &str| Group { label: label.into(), src: src.clone(), recursive: true, prunable: true, ..Default::default() };
+        let groups = [group("one"), group("two")];
+        let opts = PlanOptions { protect_newer: true, prune: true };
+        let no = AtomicBool::new(false);
+
+        let p = build(&groups, &m, &opts, &no, &mut |_| {}).unwrap();
+        assert_eq!(p.copy.len(), 1);
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        assert!(crate::sync::execute(&p, false, &no, &tx).failed.is_empty());
+
+        // the second group sees the same file again; it must not be listed for deletion
+        let p = build(&groups, &m, &opts, &no, &mut |_| {}).unwrap();
+        assert!(p.copy.is_empty());
+        assert!(p.prune.is_empty(), "{:?}", p.prune);
+        assert_eq!(p.largest_file_by_volume.len(), 0);
     }
 }
