@@ -69,7 +69,7 @@ impl App {
                 ui.label(format!("This machine has an older EMU Assistant. Replace it with this version ({})?", app_update::VERSION));
                 for (c, on) in &mut self.old_copies {
                     let from = c.version.as_deref().unwrap_or("unknown version");
-                    ui.checkbox(on, format!("{}   {from} → {}", c.path.display(), app_update::VERSION));
+                    ui.checkbox(on, format!("{}   {from} to {}", c.path.display(), app_update::VERSION));
                 }
                 ui.horizontal(|ui| {
                     let any = self.old_copies.iter().any(|(_, on)| *on);

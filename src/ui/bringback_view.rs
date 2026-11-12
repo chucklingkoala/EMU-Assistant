@@ -116,7 +116,7 @@ impl App {
                             let emu = &items[start].emu;
                             let k = group_key(emu, None);
                             let open = self.bb_open(&k, true);
-                            if ui.small_button(if open { "▼" } else { "▶" }).clicked() {
+                            if ui.small_button(if open { "-" } else { "+" }).clicked() {
                                 actions.push(ListAction::Toggle(k));
                             }
                             if let Some(on) = self.bb_range_box(ui, start..end, !busy) {
@@ -129,7 +129,7 @@ impl App {
                             ui.add_space(24.0);
                             let k = group_key(&items[start].emu, Some(class));
                             let open = self.bb_open(&k, class == Class::Save);
-                            if ui.small_button(if open { "▼" } else { "▶" }).clicked() {
+                            if ui.small_button(if open { "-" } else { "+" }).clicked() {
                                 actions.push(ListAction::Toggle(k));
                             }
                             if let Some(on) = self.bb_range_box(ui, start..end, !busy) {
@@ -152,7 +152,7 @@ impl App {
                             ui.add_sized([44.0, row_h], egui::Label::new(RichText::new(word).small().color(color)));
                             ui.add_sized([72.0, row_h], egui::Label::new(RichText::new(human_bytes(it.size)).small()));
                             ui.add(egui::Label::new(it.rel.display().to_string()).truncate())
-                                .on_hover_text(format!("{}\n→ {}", it.src.display(), it.dst.display()));
+                                .on_hover_text(format!("{}\nto {}", it.src.display(), it.dst.display()));
                         }
                     }
                 });
@@ -182,7 +182,7 @@ impl App {
     fn bb_names(&self) -> (String, String) {
         let here = std::env::var("COMPUTERNAME").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "this machine".into());
         let drive = self.pkg_root.trim();
-        (here, if drive.is_empty() { "the drive".into() } else { drive.to_string() })
+        (here, if drive.is_empty() { "the drive".into() } else { shorten(drive, 40) })
     }
 
     pub(super) fn ui_bringback_paths(&mut self, ui: &mut egui::Ui) {
@@ -194,9 +194,9 @@ impl App {
         let before = self.bb_dir;
         ui.horizontal(|ui| {
             ui.label("Direction");
-            ui.radio_value(&mut self.bb_dir, Direction::ToDrive, format!("{here} → {drive}"))
+            ui.radio_value(&mut self.bb_dir, Direction::ToDrive, format!("{here} to {drive}"))
                 .on_hover_text("On the handheld: copy saves made here to the drive");
-            ui.radio_value(&mut self.bb_dir, Direction::ToMachine, format!("{drive} → {here}"))
+            ui.radio_value(&mut self.bb_dir, Direction::ToMachine, format!("{drive} to {here}"))
                 .on_hover_text("On the main machine: copy the saves on the drive into the emulator folders here");
         });
         if self.bb_dir != before {
