@@ -3,7 +3,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use anyhow::{bail, ensure, Result};
 use serde::{Deserialize, Serialize};
@@ -96,7 +97,51 @@ pub fn detect_es_root_near_exe() -> Option<PathBuf> {
     is_es_root(&dir).then_some(dir)
 }
 
+/// Folders measured at the same time. Helps on SSDs; on a hard disk it does no harm.
+const SCAN_WORKERS: usize = 4;
+
 pub fn scan(es_root: &Path, cancel: &AtomicBool, status: &mut dyn FnMut(String)) -> Result<Catalog> {
+    scan_with(es_root, SCAN_WORKERS, cancel, status)
+}
+
+/// Runs `f` over `items` on `workers` threads. Results keep the order of `items`; an item
+/// skipped because of `cancel` gives `None`. Status lines from the workers reach `status`
+/// on the calling thread.
+fn par_map<T: Sync, R: Send>(
+    items: &[T],
+    workers: usize,
+    cancel: &AtomicBool,
+    status: &mut dyn FnMut(String),
+    f: impl Fn(&T, &dyn Fn(String)) -> R + Sync,
+) -> Vec<Option<R>> {
+    let next = AtomicUsize::new(0);
+    let out: Mutex<Vec<Option<R>>> = Mutex::new((0..items.len()).map(|_| None).collect());
+    let (tx, rx) = crossbeam_channel::unbounded::<String>();
+    std::thread::scope(|s| {
+        for _ in 0..workers.clamp(1, items.len().max(1)) {
+            let tx = tx.clone();
+            let (next, out, f) = (&next, &out, &f);
+            s.spawn(move || loop {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = items.get(i) else { break };
+                let r = f(item, &|m| {
+                    let _ = tx.send(m);
+                });
+                out.lock().unwrap()[i] = Some(r);
+            });
+        }
+        drop(tx);
+        for m in rx {
+            status(m);
+        }
+    });
+    out.into_inner().unwrap()
+}
+
+fn scan_with(es_root: &Path, workers: usize, cancel: &AtomicBool, status: &mut dyn FnMut(String)) -> Result<Catalog> {
     let es_root = normalize(es_root);
     ensure!(is_es_root(&es_root), "{} does not contain ES-DE.exe", es_root.display());
     let data = es_root.join("ES-DE");
@@ -118,21 +163,17 @@ pub fn scan(es_root: &Path, cancel: &AtomicBool, status: &mut dyn FnMut(String))
     let defs = systems::load(&es_root)?;
     let rules = find_rules::load(&es_root)?;
 
-    let mut emulators: BTreeMap<String, EmuEntry> = BTreeMap::new();
-    let mut syslist = Vec::new();
-    for def in defs {
-        if cancel.load(Ordering::Relaxed) {
-            bail!("cancelled");
-        }
+    // every system folder is listed and measured on its own thread
+    let found = par_map(&defs, workers, cancel, status, |def, status| {
         let dir = normalize(Path::new(&def.path.replace("%ROMPATH%", &rom_dir.to_string_lossy())));
         if !dir.is_dir() {
-            continue;
+            return None;
         }
         status(format!("Scanning {}…", def.name));
         let games = games::list(&dir);
         let (rom_files, rom_bytes) = (games.files, games.bytes);
         if rom_files == 0 {
-            continue;
+            return None;
         }
 
         let gl_dir = data.join("gamelists").join(&def.name);
@@ -155,17 +196,11 @@ pub fn scan(es_root: &Path, cancel: &AtomicBool, status: &mut dyn FnMut(String))
             }
         }
         let alt: Vec<String> = alt.difference(&in_use).cloned().collect();
-        for id in in_use.iter().chain(&alt) {
-            if !emulators.contains_key(id) {
-                status(format!("Locating emulator {id}…"));
-                emulators.insert(id.clone(), make_emu(id, &rules, &es_root));
-            }
-        }
 
         let gamelist_dir = gl_dir.is_dir().then_some(gl_dir);
         let sys_media = media_dir.join(&def.name);
         let media = sys_media.is_dir().then_some(sys_media);
-        syslist.push(SysEntry {
+        Some(SysEntry {
             name: def.name.clone(),
             fullname: if def.fullname.is_empty() { def.name.clone() } else { def.fullname.clone() },
             noload: dir.join("noload.txt").exists(),
@@ -179,9 +214,30 @@ pub fn scan(es_root: &Path, cancel: &AtomicBool, status: &mut dyn FnMut(String))
             emus_in_use: in_use.into_iter().collect(),
             emus_alt: alt,
             games: Some(games),
-        });
+        })
+    });
+    if cancel.load(Ordering::Relaxed) {
+        bail!("cancelled");
     }
+    let mut syslist: Vec<SysEntry> = found.into_iter().flatten().flatten().collect();
     syslist.sort_by_key(|s| s.fullname.to_lowercase());
+
+    // then every emulator used by those systems
+    let ids: Vec<String> = syslist
+        .iter()
+        .flat_map(|s| s.emus_in_use.iter().chain(&s.emus_alt))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let emus = par_map(&ids, workers, cancel, status, |id, status| {
+        status(format!("Locating emulator {id}…"));
+        make_emu(id, &rules, &es_root)
+    });
+    if cancel.load(Ordering::Relaxed) {
+        bail!("cancelled");
+    }
+    let emulators: BTreeMap<String, EmuEntry> = ids.into_iter().zip(emus).filter_map(|(id, e)| Some((id, e?))).collect();
 
     status("Measuring ES-DE folders…".into());
     // EMUAssistant\ holds update backups, which stay on this machine
@@ -211,11 +267,16 @@ pub fn scan(es_root: &Path, cancel: &AtomicBool, status: &mut dyn FnMut(String))
         ("collections", "Custom collections", data.join("collections"), vec![], true),
         ("rom_root_files", "ROM folder root files (systems.txt)", rom_dir.clone(), vec![], false),
     ];
+    let candidates: Vec<_> = candidates.into_iter().filter(|c| c.2.is_dir()).collect();
+    let sizes = par_map(&candidates, workers, cancel, status, |c, _| dir_size(&c.2, &c.3, c.4).1);
+    if cancel.load(Ordering::Relaxed) {
+        bail!("cancelled");
+    }
     let globals = candidates
         .into_iter()
-        .filter(|c| c.2.is_dir())
-        .map(|(id, label, src, excludes, recursive)| GlobalEntry {
-            bytes: dir_size(&src, &excludes, recursive).1,
+        .zip(sizes)
+        .map(|((id, label, src, excludes, recursive), bytes)| GlobalEntry {
+            bytes: bytes.unwrap_or(0),
             id: id.into(),
             label: label.into(),
             src,
@@ -467,5 +528,29 @@ pub(crate) mod tests {
         let prog = cat.globals.iter().find(|g| g.id == "esde_program").unwrap();
         // ES-DE.exe + resources only: Emulators, ROMs and the ES-DE data folder are excluded
         assert_eq!(prog.bytes, 3 + dir_size(&es.join("resources"), &[], true).1);
+    }
+
+    #[test]
+    fn threaded_scan_matches_single_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (es, _) = fake_install(tmp.path());
+        let no = AtomicBool::new(false);
+        let one = scan_with(&es, 1, &no, &mut |_| {}).unwrap();
+        let many = scan_with(&es, 8, &no, &mut |_| {}).unwrap();
+        let json = |c: &Catalog| serde_json::to_string(c).unwrap();
+        assert_eq!(json(&one), json(&many));
+        assert!(scan_with(&es, 4, &AtomicBool::new(true), &mut |_| {}).is_err());
+    }
+
+    #[test]
+    fn par_map_keeps_order() {
+        let items: Vec<u32> = (0..100).collect();
+        let mut lines = 0;
+        let out = par_map(&items, 4, &AtomicBool::new(false), &mut |_| lines += 1, |i, status| {
+            status(i.to_string());
+            i * 2
+        });
+        assert_eq!(out, items.iter().map(|i| Some(i * 2)).collect::<Vec<_>>());
+        assert_eq!(lines, 100);
     }
 }
