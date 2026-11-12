@@ -86,14 +86,18 @@ enum Job {
     Plan { rx: Receiver<Msg<Plan>>, cancel: Arc<AtomicBool>, fp: String },
     Check { rx: Receiver<Msg<Vec<UpdateItem>>>, cancel: Arc<AtomicBool> },
     Copy { rx: Receiver<Event>, cancel: Arc<AtomicBool>, after: After },
+    /// Deploy: listing the games of some systems on the drive; then opens the picker for `open`.
+    Games { rx: Receiver<Msg<Vec<(String, GameList)>>>, cancel: Arc<AtomicBool>, open: Option<String> },
 }
 
 impl Job {
     fn cancel(&self) {
         match self {
-            Job::Scan { cancel, .. } | Job::Plan { cancel, .. } | Job::Check { cancel, .. } | Job::Copy { cancel, .. } => {
-                cancel.store(true, Ordering::Relaxed)
-            }
+            Job::Scan { cancel, .. }
+            | Job::Plan { cancel, .. }
+            | Job::Check { cancel, .. }
+            | Job::Copy { cancel, .. }
+            | Job::Games { cancel, .. } => cancel.store(true, Ordering::Relaxed),
         }
     }
 }
@@ -344,16 +348,45 @@ impl App {
 
     /// Opens the game picker, listing the games on the drive first in Deploy mode.
     fn open_games(&mut self, name: &str) {
-        if self.mode == Mode::Deploy {
-            let pkg = normalize(Path::new(self.pkg_root.trim()));
-            if let Some(cat) = self.deploy_cat.as_mut() {
-                if let Some(s) = Arc::make_mut(cat).systems.iter_mut().find(|s| s.name == name && s.games.is_none()) {
-                    s.games = Some(games::list(&mirror(&pkg, &s.rom_dir)));
-                }
-            }
+        if self.mode == Mode::Deploy && self.start_list_games(&[name.to_string()], Some(name.to_string())) {
+            return;
         }
         self.games_filter.clear();
         self.games_open = Some(name.to_string());
+    }
+
+    /// Deploy: lists the games on the drive of those `names` that aren't listed yet, on a
+    /// worker thread. Returns false when there is nothing to list.
+    fn start_list_games(&mut self, names: &[String], open: Option<String>) -> bool {
+        let Some(cat) = &self.deploy_cat else { return false };
+        let pkg = normalize(Path::new(self.pkg_root.trim()));
+        let todo: Vec<(String, PathBuf)> = cat
+            .systems
+            .iter()
+            .filter(|s| s.games.is_none() && names.contains(&s.name))
+            .map(|s| (s.name.clone(), mirror(&pkg, &s.rom_dir)))
+            .collect();
+        if todo.is_empty() {
+            return false;
+        }
+        let (tx, rx) = unbounded();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c = cancel.clone();
+        thread::spawn(move || {
+            let mut out = Vec::new();
+            for (name, dir) in todo {
+                if c.load(Ordering::Relaxed) {
+                    let _ = tx.send(Msg::Done(Err(anyhow::anyhow!("cancelled"))));
+                    return;
+                }
+                let _ = tx.send(Msg::Status(format!("Listing the {name} games on the drive…")));
+                out.push((name, games::list(&dir)));
+            }
+            let _ = tx.send(Msg::Done(Ok(out)));
+        });
+        self.status = "Listing games on the drive…".into();
+        self.job = Some(Job::Games { rx, cancel, open });
+        true
     }
 
     /// Applies the picker's ticks: every game means no filter (new games are copied too),
@@ -772,6 +805,29 @@ impl App {
                 }
                 Some(Err(e)) => {
                     self.status = format!("Analyze failed: {e:#}");
+                    None
+                }
+            },
+            Job::Games { rx, cancel, open } => match drain(&rx, &mut self.status) {
+                None => Some(Job::Games { rx, cancel, open }),
+                Some(Ok(lists)) => {
+                    if let Some(cat) = self.deploy_cat.as_mut() {
+                        let cat = Arc::make_mut(cat);
+                        for (name, list) in lists {
+                            if let Some(s) = cat.systems.iter_mut().find(|s| s.name == name) {
+                                s.games = Some(list);
+                            }
+                        }
+                    }
+                    self.status = "Games listed".into();
+                    if let Some(name) = open {
+                        self.games_filter.clear();
+                        self.games_open = Some(name);
+                    }
+                    None
+                }
+                Some(Err(e)) => {
+                    self.status = format!("Could not list the games: {e:#}");
                     None
                 }
             },
