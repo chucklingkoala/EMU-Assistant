@@ -55,7 +55,7 @@ Copies are **incremental and resumable**. Files that are already up to date are 
 
 - Windows 10 or 11 on both machines.
 - The **portable** release of ES-DE (the folder containing `ES-DE.exe`, with `Emulators\` next to it). The ROM folder can live anywhere: inside the ES-DE folder, or somewhere separate such as `D:\Games\ROMs`.
-- An external drive large enough for your selection. NTFS is recommended. exFAT works for copying, but ES-DE itself runs slowly from exFAT (see the ES-DE user guide).
+- An external drive large enough for your selection. NTFS is recommended. exFAT works for copying, but ES-DE itself runs slowly from exFAT (see the ES-DE user guide). FAT32 can't hold files of 4 GB or more; EMU Assistant warns before copying.
 
 ## Getting started
 

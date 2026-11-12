@@ -896,6 +896,7 @@ impl App {
             Job::Plan { rx, cancel, fp } => match drain(&rx, &mut self.status) {
                 None => Some(Job::Plan { rx, cancel, fp }),
                 Some(Ok(plan)) => {
+                    self.drives = drives::list();
                     self.status = format!(
                         "Ready: {} files ({}) to copy, {} already up to date",
                         plan.copy.len(),
@@ -1746,7 +1747,10 @@ impl App {
         let busy = self.job.is_some();
         let fresh = self.plan_is_fresh();
         let plan = self.plan.as_ref().map(|(_, p)| p.clone());
-        let space_issues = plan.as_ref().map(|p| space_problems(p)).unwrap_or_default();
+        let mut space_issues = plan.as_ref().map(|p| space_problems(p)).unwrap_or_default();
+        if let Some(p) = &plan {
+            space_issues.extend(fat32_problems(p, &self.drives));
+        }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             let can_plan = !busy && self.cat().is_some();
@@ -2517,6 +2521,25 @@ fn space_problems(plan: &Plan) -> Vec<String> {
             })
         })
         .collect()
+}
+
+/// FAT32 can't hold files of 4 GiB or more.
+fn fat32_problems(plan: &Plan, drives: &[DriveInfo]) -> Vec<String> {
+    const FAT32_MAX: u64 = u32::MAX as u64;
+    let mut out = Vec::new();
+    for (vol, largest) in &plan.largest_file_by_volume {
+        if *largest <= FAT32_MAX {
+            continue;
+        }
+        let fat32 = drives.iter().any(|d| d.root.eq_ignore_ascii_case(vol) && d.fs.eq_ignore_ascii_case("FAT32"));
+        if fat32 {
+            out.push(format!(
+                "{vol} is formatted as FAT32, which can't hold files of 4 GB or more (the largest file here is {}). Format the drive as exFAT or NTFS.",
+                human_bytes(*largest)
+            ));
+        }
+    }
+    out
 }
 
 fn report_summary(r: &Report) -> String {
