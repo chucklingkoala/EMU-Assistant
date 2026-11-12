@@ -2538,6 +2538,6 @@ fn copy_self(dest_root: &Path) -> anyhow::Result<Option<PathBuf>> {
             return Ok(None);
         }
     }
-    sync::copy_file(&exe, &target, mtime, &AtomicBool::new(false), &mut |_| {})?;
+    sync::copy_file(&exe, &target, mtime, false, &AtomicBool::new(false), &mut |_| {})?;
     Ok(Some(target))
 }

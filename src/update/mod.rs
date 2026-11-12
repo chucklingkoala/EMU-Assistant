@@ -605,7 +605,7 @@ fn install_one(item: &UpdateItem, ctx: &mut Ctx) -> Result<u64> {
     for (src, dst) in &todo {
         let mtime = fs::metadata(src).map(|m| FileTime::from_last_modification_time(&m)).unwrap_or_else(|_| FileTime::now());
         // not cancellable mid-way: a half-installed program is worse than a finished one
-        if let Err(e) = sync::copy_file(src, dst, mtime, &never, &mut |_| {}) {
+        if let Err(e) = sync::copy_file(src, dst, mtime, false, &never, &mut |_| {}) {
             let msg = format!("installing {}: {e}", dst.display());
             return Err(match &backup {
                 Some(zip) => match archive::restore(zip, None, &never) {

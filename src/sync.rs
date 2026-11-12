@@ -48,11 +48,14 @@ fn part_path(dst: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Copies one file. Returns `Ok(false)` if cancelled (the partial file is removed).
+/// Copies one file. Returns `Ok(false)` if cancelled. With `verify`, the copy is re-read
+/// and compared with the source before it takes the destination's name. A cancelled or
+/// failed copy leaves no part file behind and does not touch an existing destination file.
 pub fn copy_file(
     src: &Path,
     dst: &Path,
     mtime: FileTime,
+    verify: bool,
     cancel: &AtomicBool,
     on_bytes: &mut dyn FnMut(u64),
 ) -> io::Result<bool> {
@@ -61,13 +64,40 @@ pub fn copy_file(
         fs::create_dir_all(parent)?;
     }
     let part = part_path(&dst);
-    let mut r = File::open(&src)?;
-    let mut w = File::create(&part)?;
+    let res = write_part(&src, &part, mtime, verify, cancel, on_bytes).and_then(|done| {
+        if done {
+            if let Ok(m) = fs::metadata(&dst) {
+                let mut p = m.permissions();
+                if p.readonly() {
+                    #[allow(clippy::permissions_set_readonly_false)]
+                    p.set_readonly(false);
+                    let _ = fs::set_permissions(&dst, p);
+                }
+            }
+            fs::rename(&part, &dst)?;
+        }
+        Ok(done)
+    });
+    if !matches!(res, Ok(true)) {
+        let _ = fs::remove_file(&part);
+    }
+    res
+}
+
+/// Writes `src` to `part` (both already in long-path form). `Ok(false)` when cancelled.
+fn write_part(
+    src: &Path,
+    part: &Path,
+    mtime: FileTime,
+    verify: bool,
+    cancel: &AtomicBool,
+    on_bytes: &mut dyn FnMut(u64),
+) -> io::Result<bool> {
+    let mut r = File::open(src)?;
+    let mut w = File::create(part)?;
     let mut buf = vec![0u8; BUF];
     loop {
         if cancel.load(Ordering::Relaxed) {
-            drop(w);
-            let _ = fs::remove_file(&part);
             return Ok(false);
         }
         let n = r.read(&mut buf)?;
@@ -79,16 +109,10 @@ pub fn copy_file(
     }
     w.sync_all()?;
     drop(w);
-    filetime::set_file_mtime(&part, mtime)?;
-    if let Ok(m) = fs::metadata(&dst) {
-        let mut p = m.permissions();
-        if p.readonly() {
-            #[allow(clippy::permissions_set_readonly_false)]
-            p.set_readonly(false);
-            let _ = fs::set_permissions(&dst, p);
-        }
+    if verify && !same_content(src, part)? {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "verification failed: the copy differs from the source"));
     }
-    fs::rename(&part, &dst)?;
+    filetime::set_file_mtime(part, mtime)?;
     Ok(true)
 }
 
@@ -111,6 +135,15 @@ pub fn same_content(a: &Path, b: &Path) -> io::Result<bool> {
     }
 }
 
+/// After this many failed files in a row the run stops: the drive is most likely gone.
+const MAX_CONSECUTIVE_FAILURES: u32 = 20;
+
+/// Errors after which trying more files is pointless: disk full, device not ready or removed.
+fn is_fatal(e: &io::Error) -> bool {
+    // ERROR_NOT_READY 21, ERROR_HANDLE_DISK_FULL 39, ERROR_DISK_FULL 112, ERROR_DEVICE_NOT_CONNECTED 1167
+    e.kind() == io::ErrorKind::StorageFull || matches!(e.raw_os_error(), Some(21 | 39 | 112 | 1167))
+}
+
 pub fn execute(plan: &Plan, verify: bool, cancel: &AtomicBool, tx: &Sender<Event>) -> Report {
     let start = Instant::now();
     let mut report = Report::default();
@@ -127,13 +160,15 @@ pub fn execute(plan: &Plan, verify: bool, cancel: &AtomicBool, tx: &Sender<Event
     let total_files = plan.copy.len() as u64;
     let mut done = 0u64;
     let mut last = Instant::now() - Duration::from_secs(1);
+    let mut consecutive = 0u32;
+    let mut stopped = false;
     for (i, item) in plan.copy.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             report.cancelled = true;
             break;
         }
         let mut file_done = 0u64;
-        let res = copy_file(&item.src, &item.dst, item.mtime, cancel, &mut |n| {
+        let res = copy_file(&item.src, &item.dst, item.mtime, verify, cancel, &mut |n| {
             file_done += n;
             if last.elapsed() >= Duration::from_millis(100) {
                 last = Instant::now();
@@ -148,14 +183,9 @@ pub fn execute(plan: &Plan, verify: bool, cancel: &AtomicBool, tx: &Sender<Event
         });
         match res {
             Ok(true) => {
-                if verify && !same_content(&item.src, &item.dst).unwrap_or(false) {
-                    let _ = fs::remove_file(long(&item.dst));
-                    report.failed.push(format!("{}: verification failed", item.dst.display()));
-                    log(format!("Verification failed, removed {}", item.dst.display()));
-                } else {
-                    report.copied += 1;
-                    report.copied_bytes += item.size;
-                }
+                consecutive = 0;
+                report.copied += 1;
+                report.copied_bytes += item.size;
             }
             Ok(false) => {
                 report.cancelled = true;
@@ -164,12 +194,24 @@ pub fn execute(plan: &Plan, verify: bool, cancel: &AtomicBool, tx: &Sender<Event
             Err(e) => {
                 report.failed.push(format!("{}: {e}", item.src.display()));
                 log(format!("Failed {}: {e}", item.src.display()));
+                consecutive += 1;
+                if is_fatal(&e) || consecutive >= MAX_CONSECUTIVE_FAILURES {
+                    let why = if is_fatal(&e) {
+                        format!("Stopped: {e}. The remaining files were not copied.")
+                    } else {
+                        format!("Stopped after {consecutive} failed files in a row. Is the drive still connected?")
+                    };
+                    report.failed.push(why.clone());
+                    log(why);
+                    stopped = true;
+                    break;
+                }
             }
         }
         done += item.size;
     }
 
-    if !report.cancelled {
+    if !report.cancelled && !stopped {
         for p in &plan.prune {
             match fs::remove_file(long(p)) {
                 Ok(()) => report.pruned += 1,
@@ -267,8 +309,22 @@ mod tests {
         fs::write(&src, vec![0u8; BUF * 2]).unwrap();
         let dst = tmp.path().join(r"out\big.bin");
         let cancel = AtomicBool::new(false);
-        let ok = copy_file(&src, &dst, FileTime::now(), &cancel, &mut |_| cancel.store(true, Ordering::Relaxed)).unwrap();
+        let ok = copy_file(&src, &dst, FileTime::now(), false, &cancel, &mut |_| cancel.store(true, Ordering::Relaxed)).unwrap();
         assert!(!ok);
         assert!(!dst.exists() && !part_path(&dst).exists());
+    }
+
+    #[test]
+    fn failed_copy_leaves_no_partial_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("a.bin");
+        fs::write(&src, b"data").unwrap();
+        // the destination name is taken by a non-empty folder, so the final rename fails
+        let dst = tmp.path().join("out");
+        fs::create_dir_all(dst.join("sub")).unwrap();
+        let r = copy_file(&src, &dst, FileTime::now(), true, &AtomicBool::new(false), &mut |_| {});
+        assert!(r.is_err());
+        assert!(!part_path(&dst).exists());
+        assert!(dst.join("sub").is_dir());
     }
 }

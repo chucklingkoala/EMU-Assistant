@@ -193,7 +193,7 @@ pub fn older_copies(candidates: &[PathBuf], running: &Path, current: &str) -> Ve
 pub fn replace(target: &Path, source: &Path) -> Result<()> {
     let new = sibling(target, ".new");
     let meta = fs::metadata(long(source))?;
-    sync::copy_file(source, &new, FileTime::from_last_modification_time(&meta), &AtomicBool::new(false), &mut |_| {})
+    sync::copy_file(source, &new, FileTime::from_last_modification_time(&meta), false, &AtomicBool::new(false), &mut |_| {})
         .with_context(|| format!("copying to {}", new.display()))?;
     let placed = check_exe(&new, meta.len(), None).and_then(|()| swap(target, &new));
     if placed.is_err() {
