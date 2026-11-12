@@ -209,47 +209,75 @@ pub fn compute_status(p: &Program, rel: &Release) -> Status {
     ))
 }
 
+/// Servers asked at the same time by [`check`].
+const CHECK_WORKERS: usize = 6;
+
 /// Looks up the latest release of every item that has a source.
 pub fn check(items: &mut [UpdateItem], opts: &Opts, cancel: &AtomicBool, status: &mut dyn FnMut(String)) -> Result<()> {
     let http = Http::new(opts.github_token.clone());
-    for item in items.iter_mut() {
-        if cancel.load(Ordering::Relaxed) {
-            bail!("cancelled");
+    let (tx, rx) = crossbeam_channel::unbounded::<String>();
+    let queue = std::sync::Mutex::new(items.iter_mut());
+    std::thread::scope(|s| {
+        for _ in 0..CHECK_WORKERS {
+            let tx = tx.clone();
+            let (queue, http) = (&queue, &http);
+            s.spawn(move || loop {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                // take the next item; the lock is released before the network call
+                let next = queue.lock().unwrap().next();
+                let Some(item) = next else { break };
+                check_one(http, item, opts, &|m| {
+                    let _ = tx.send(m);
+                });
+            });
         }
-        item.source = source_for(item.id(), &opts.sources);
-        item.installed = installed_text(&item.program);
-        item.cores.clear();
-        item.cores_note = None;
-        if matches!(item.status, Status::CantUpdate(_)) && !scan::is_program_files(&item.program.dir) {
-            item.status = Status::NotChecked; // a source may have been added since
+        drop(tx);
+        for m in rx {
+            status(m);
         }
-        if matches!(item.status, Status::CantUpdate(_)) {
-            continue;
-        }
-        let Some(spec) = item.source.clone() else {
-            item.status = Status::CantUpdate("no update source; set one in Settings > Update sources".into());
-            continue;
-        };
-        status(format!("Checking {}…", item.id()));
-        match sources::latest(&http, &spec) {
-            Ok(rel) => {
-                item.status = compute_status(&item.program, &rel);
-                item.latest = Some(rel);
-            }
-            Err(e) => {
-                item.latest = None;
-                item.status = Status::Failed(format!("{e:#}"));
-            }
-        }
-        if opts.cores && is_retroarch(&item.program) {
-            status("Checking RetroArch cores…".into());
-            match check_cores(&http, &item.program.dir) {
-                Ok(c) => item.cores = c,
-                Err(e) => item.cores_note = Some(format!("could not check cores: {e:#}")),
-            }
-        }
+    });
+    if cancel.load(Ordering::Relaxed) {
+        bail!("cancelled");
     }
     Ok(())
+}
+
+/// Looks up one item's latest release, and for RetroArch its cores.
+fn check_one(http: &Http, item: &mut UpdateItem, opts: &Opts, status: &dyn Fn(String)) {
+    item.source = source_for(item.id(), &opts.sources);
+    item.installed = installed_text(&item.program);
+    item.cores.clear();
+    item.cores_note = None;
+    if matches!(item.status, Status::CantUpdate(_)) && !scan::is_program_files(&item.program.dir) {
+        item.status = Status::NotChecked; // a source may have been added since
+    }
+    if matches!(item.status, Status::CantUpdate(_)) {
+        return;
+    }
+    let Some(spec) = item.source.clone() else {
+        item.status = Status::CantUpdate("no update source; set one in Settings > Update sources".into());
+        return;
+    };
+    status(format!("Checking {}…", item.id()));
+    match sources::latest(http, &spec) {
+        Ok(rel) => {
+            item.status = compute_status(&item.program, &rel);
+            item.latest = Some(rel);
+        }
+        Err(e) => {
+            item.latest = None;
+            item.status = Status::Failed(format!("{e:#}"));
+        }
+    }
+    if opts.cores && is_retroarch(&item.program) {
+        status("Checking RetroArch cores…".into());
+        match check_cores(http, &item.program.dir) {
+            Ok(c) => item.cores = c,
+            Err(e) => item.cores_note = Some(format!("could not check cores: {e:#}")),
+        }
+    }
 }
 
 pub fn is_retroarch(p: &Program) -> bool {
