@@ -1,6 +1,6 @@
 [package]
 name = "emu-assistant"
-version = "0.5.0"
+version = "0.5.5"
 edition = "2021"
 description = "EMU Assistant: copy selected ES-DE systems, emulators and ES-DE itself to an external drive and deploy them on another machine"
 authors = ["ChucklingKoala <techteam@chucklingkoala.com>", "Claude (Anthropic)"]
