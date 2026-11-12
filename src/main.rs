@@ -3,6 +3,7 @@
 mod config;
 mod deploy;
 mod drives;
+mod export;
 mod esde;
 mod fsutil;
 mod games;
@@ -13,6 +14,7 @@ mod paths;
 mod plan;
 mod power;
 mod scan;
+mod select;
 mod sync;
 mod ui;
 mod update;

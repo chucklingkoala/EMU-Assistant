@@ -1,6 +1,6 @@
 //! Drive enumeration and free space via the Win32 API.
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct DriveInfo {
     pub root: String,
     pub label: String,

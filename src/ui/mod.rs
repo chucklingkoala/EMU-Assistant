@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{unbounded, Receiver, TryRecvError};
 use eframe::egui::{self, Color32, RichText};
-use filetime::FileTime;
 
 use crate::config::{self, Config};
 use crate::deploy;
@@ -30,7 +29,7 @@ use crate::gauge::{self, TankReading, TankTextures, ACCENT};
 use crate::manifest::{self, Manifest};
 use crate::paths::{eq_ci, mirror, normalize, volume_root};
 use crate::plan::{self, Mapper, Plan, PlanOptions, Selection};
-use crate::scan::{self, Catalog, EmuEntry, Roots};
+use crate::scan::{self, Catalog, Roots};
 use crate::sync::{self, Event, Progress, Report};
 use crate::update::app::{self as app_update, AppRelease, OldCopy};
 use crate::update::archive::BackupMeta;
@@ -41,12 +40,12 @@ use crate::APP_NAME;
 use theme::*;
 use widgets::*;
 
+use crate::select::{self, emu_bytes, fat32_problems, fmt_secs, report_summary};
+
 const MAX_LOG: usize = 5000;
 
-/// Emulator size with skipped optional folders (cheats / thumbnails) left out.
-fn emu_bytes(e: &EmuEntry, sel: &Selection) -> u64 {
-    let skipped: u64 = e.optional_dirs.iter().filter(|o| sel.excludes_kind(&o.kind)).map(|o| o.bytes).sum();
-    e.bytes.saturating_sub(skipped)
+fn space_problems(plan: &Plan) -> Vec<String> {
+    select::space_problems(plan, |vol| drives::free_space(Path::new(vol)))
 }
 
 #[derive(PartialEq, Clone, Copy, serde::Serialize)]
@@ -308,37 +307,14 @@ impl App {
         self.progress = None;
         self.games_open = None;
         let Some(cat) = self.cat() else { return };
-        let all_globals: BTreeSet<String> = cat.globals.iter().map(|g| g.id.clone()).collect();
-        let all_systems = cat.systems.iter().map(|s| s.name.clone());
         match self.mode {
             Mode::Update => {}
             Mode::Export => {
-                self.sel = Selection {
-                    systems: all_systems.filter(|s| self.cfg.systems.contains(s)).collect(),
-                    emulators: BTreeSet::new(),
-                    globals: match &self.cfg.globals {
-                        Some(g) => g.intersection(&all_globals).cloned().collect(),
-                        None => all_globals,
-                    },
-                    media: self.cfg.media.unwrap_or(true),
-                    gamelists: self.cfg.gamelists.unwrap_or(true),
-                    exclude_cheats: self.cfg.exclude_cheats.unwrap_or(true),
-                    exclude_thumbnails: self.cfg.exclude_thumbnails.unwrap_or(true),
-                    games: self.cfg.games.clone(),
-                };
+                self.sel = select::export_selection(&cat, &self.cfg);
                 self.emu_override = self.cfg.emu_override.clone();
             }
             Mode::Deploy => {
-                self.sel = Selection {
-                    systems: all_systems.collect(),
-                    emulators: BTreeSet::new(),
-                    globals: all_globals,
-                    media: true,
-                    gamelists: true,
-                    exclude_cheats: self.cfg.exclude_cheats.unwrap_or(true),
-                    exclude_thumbnails: self.cfg.exclude_thumbnails.unwrap_or(true),
-                    games: BTreeMap::new(),
-                };
+                self.sel = select::deploy_selection(&cat, &self.cfg);
                 self.emu_override.clear();
             }
         }
@@ -346,54 +322,24 @@ impl App {
 
     /// Emulators referenced by the selected systems: id -> (used by default/override, system names).
     fn relevant_emus(&self, cat: &Catalog) -> BTreeMap<String, (bool, Vec<String>)> {
-        let mut m: BTreeMap<String, (bool, Vec<String>)> = BTreeMap::new();
-        for s in cat.systems.iter().filter(|s| self.sel.systems.contains(&s.name)) {
-            for id in &s.emus_in_use {
-                let e = m.entry(id.clone()).or_default();
-                e.0 = true;
-                e.1.push(s.fullname.clone());
-            }
-            for id in &s.emus_alt {
-                m.entry(id.clone()).or_default().1.push(s.fullname.clone());
-            }
-        }
-        m
+        select::relevant_emus(cat, &self.sel)
     }
 
     fn effective_emus(&self) -> BTreeSet<String> {
         let Some(cat) = self.cat() else { return BTreeSet::new() };
-        self.relevant_emus(&cat)
-            .into_iter()
-            .filter(|(id, (in_use, _))| {
-                cat.emulators.get(id).is_some_and(|e| {
-                    e.copyable && self.emu_override.get(id).copied().unwrap_or(*in_use && e.auto)
-                })
-            })
-            .map(|(id, _)| id)
-            .collect()
+        select::effective_emus(&cat, &self.sel, &self.emu_override)
     }
 
-    /// The game list and picked games of a system whose games are picked one by one.
     fn picked_games<'a>(&'a self, s: &'a scan::SysEntry) -> Option<(&'a GameList, &'a BTreeSet<String>)> {
-        Some((s.games.as_ref()?, self.sel.games.get(&s.name)?))
+        select::picked_games(s, &self.sel)
     }
 
-    /// ROM bytes of the picked games, and their share of the system's games (for media).
     fn rom_bytes(&self, s: &scan::SysEntry) -> (u64, f64) {
-        match self.picked_games(s) {
-            Some((list, picked)) => {
-                let share = list.picked_count(picked) as f64 / list.games.len().max(1) as f64;
-                (list.picked(picked).1, share)
-            }
-            None => (s.rom_bytes, 1.0),
-        }
+        select::rom_bytes(s, &self.sel)
     }
 
-    /// Space one system needs with the current media / gamelist options.
     fn system_bytes(&self, s: &scan::SysEntry) -> u64 {
-        let (roms, share) = self.rom_bytes(s);
-        roms + if self.sel.media { (s.media_bytes as f64 * share) as u64 } else { 0 }
-            + if self.sel.gamelists { s.gamelist_bytes } else { 0 }
+        select::system_bytes(s, &self.sel)
     }
 
     /// Opens the game picker, listing the games on the drive first in Deploy mode.
@@ -413,17 +359,7 @@ impl App {
     /// Applies the picker's ticks: every game means no filter (new games are copied too),
     /// none unticks the system.
     fn set_games(&mut self, system: &str, picked: BTreeSet<String>, total: usize) {
-        if picked.is_empty() {
-            self.sel.games.remove(system);
-            self.sel.systems.remove(system);
-        } else {
-            if picked.len() >= total {
-                self.sel.games.remove(system);
-            } else {
-                self.sel.games.insert(system.to_string(), picked);
-            }
-            self.sel.systems.insert(system.to_string());
-        }
+        select::set_games(&mut self.sel, system, picked, total);
         if self.mode == Mode::Export {
             self.cfg.games = self.sel.games.clone();
             config::save(&self.cfg);
@@ -431,16 +367,7 @@ impl App {
     }
 
     fn selected_bytes(&self, cat: &Catalog) -> u64 {
-        let sys: u64 = cat
-            .systems
-            .iter()
-            .filter(|s| self.sel.systems.contains(&s.name))
-            .map(|s| self.system_bytes(s))
-            .sum();
-        let emu: u64 =
-            self.sel.emulators.iter().filter_map(|id| cat.emulators.get(id)).map(|e| emu_bytes(e, &self.sel)).sum();
-        let glob: u64 = cat.globals.iter().filter(|g| self.sel.globals.contains(&g.id)).map(|g| g.bytes).sum();
-        sys + emu + glob
+        select::selected_bytes(cat, &self.sel)
     }
 
     // ---------- jobs ----------
@@ -581,29 +508,8 @@ impl App {
                 self.remember_export(&dest_root);
                 thread::spawn(move || {
                     let _awake = crate::power::KeepAwake::start();
-                    let log = |s: String| {
-                        let _ = tx.send(Event::Log(s));
-                    };
-                    let existing = manifest::load(&dest_root).unwrap_or_else(|e| {
-                        log(format!("Ignoring unreadable manifest: {e:#}"));
-                        None
-                    });
-                    let mut m = manifest::for_export(existing, &cat, &sel);
-                    if let Err(e) = manifest::save(&dest_root, &m) {
-                        log(format!("Could not write manifest: {e:#}"));
-                    }
-                    let report = sync::execute(&plan, verify, &c, &tx);
-                    m.complete = !report.cancelled && report.failed.is_empty();
-                    if let Err(e) = manifest::save(&dest_root, &m) {
-                        log(format!("Could not write manifest: {e:#}"));
-                    }
-                    if copy_exe {
-                        match copy_self(&dest_root) {
-                            Ok(Some(p)) => log(format!("Copied EMU Assistant to {} (run it on the target machine to deploy)", p.display())),
-                            Ok(None) => {}
-                            Err(e) => log(format!("Could not copy EMU Assistant itself to the drive: {e:#}")),
-                        }
-                    }
+                    let job = crate::export::Job { cat: &cat, sel: &sel, plan: &plan, dest_root: &dest_root, verify, copy_exe };
+                    let report = crate::export::run(&job, &c, &tx);
                     let _ = tx.send(Event::Done(report));
                 });
             }
@@ -1073,54 +979,6 @@ fn drain<T>(rx: &Receiver<Msg<T>>, status: &mut String) -> Option<anyhow::Result
     }
 }
 
-fn space_problems(plan: &Plan) -> Vec<String> {
-    plan.bytes_by_volume
-        .iter()
-        .filter_map(|(vol, need)| {
-            let free = drives::free_space(Path::new(vol))?;
-            (free < *need).then(|| {
-                format!("Not enough space on {vol}: needs {}, only {} free", human_bytes(*need), human_bytes(free))
-            })
-        })
-        .collect()
-}
-
-/// FAT32 can't hold files of 4 GiB or more.
-fn fat32_problems(plan: &Plan, drives: &[DriveInfo]) -> Vec<String> {
-    const FAT32_MAX: u64 = u32::MAX as u64;
-    let mut out = Vec::new();
-    for (vol, largest) in &plan.largest_file_by_volume {
-        if *largest <= FAT32_MAX {
-            continue;
-        }
-        let fat32 = drives.iter().any(|d| d.root.eq_ignore_ascii_case(vol) && d.fs.eq_ignore_ascii_case("FAT32"));
-        if fat32 {
-            out.push(format!(
-                "{vol} is formatted as FAT32, which can't hold files of 4 GB or more (the largest file here is {}). Format the drive as exFAT or NTFS.",
-                human_bytes(*largest)
-            ));
-        }
-    }
-    out
-}
-
-fn report_summary(r: &Report) -> String {
-    let mut s = format!(
-        "{} {} files ({}) in {}",
-        if r.cancelled { "Cancelled after copying" } else { "Last run: copied" },
-        r.copied,
-        human_bytes(r.copied_bytes),
-        fmt_secs(r.elapsed.as_secs_f64())
-    );
-    if r.pruned > 0 {
-        s += &format!(", deleted {}", r.pruned);
-    }
-    if !r.failed.is_empty() {
-        s += &format!(", {} errors (see log)", r.failed.len());
-    }
-    s
-}
-
 fn update_summary(r: &Report, after: After) -> String {
     let mut s = match after {
         After::Restored => format!("Restore: put back {} files, removed {} added files", r.copied, r.pruned),
@@ -1138,28 +996,4 @@ fn update_summary(r: &Report, after: After) -> String {
         s += &format!(", {} failed (see log)", r.failed.len());
     }
     s
-}
-
-/// Puts this exe on the drive so it can be run on the target machine for deployment.
-/// The copy made under the old name by earlier versions is removed.
-fn copy_self(dest_root: &Path) -> anyhow::Result<Option<PathBuf>> {
-    let exe = std::env::current_exe()?;
-    let legacy = dest_root.join(manifest::LEGACY_EXE_NAME);
-    if legacy.is_file() && !eq_ci(&exe, &legacy) {
-        let _ = std::fs::remove_file(&legacy);
-    }
-    let target = dest_root.join(manifest::EXE_NAME);
-    if eq_ci(&exe, &target) {
-        return Ok(None);
-    }
-    let meta = std::fs::metadata(&exe)?;
-    let mtime = FileTime::from_last_modification_time(&meta);
-    if let Ok(t) = std::fs::metadata(&target) {
-        let diff = FileTime::from_last_modification_time(&t).unix_seconds() - mtime.unix_seconds();
-        if t.len() == meta.len() && diff.abs() <= 2 {
-            return Ok(None);
-        }
-    }
-    sync::copy_file(&exe, &target, mtime, false, &AtomicBool::new(false), &mut |_| {})?;
-    Ok(Some(target))
 }

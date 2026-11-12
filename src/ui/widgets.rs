@@ -58,12 +58,3 @@ pub(super) fn shorten(s: &str, max: usize) -> String {
         format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
     }
 }
-
-pub(super) fn fmt_secs(s: f64) -> String {
-    let s = s.max(0.0) as u64;
-    match s {
-        s if s >= 3600 => format!("{}h {:02}m", s / 3600, (s % 3600) / 60),
-        s if s >= 60 => format!("{}m {:02}s", s / 60, s % 60),
-        s => format!("{s}s"),
-    }
-}
