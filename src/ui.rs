@@ -1548,25 +1548,36 @@ impl App {
                 ui.separator();
                 // leave room for the separator and the Done button below
                 let footer = ui.spacing().interact_size.y + ui.spacing().item_spacing.y * 3.0;
-                egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(ui.available_height() - footer).show(ui, |ui| {
-                    egui::Grid::new("games").striped(true).num_columns(4).spacing([14.0, 4.0]).show(ui, |ui| {
-                        for g in visible {
-                            let mut on = picked.contains(&g.key);
-                            if ui.add_enabled(!busy, egui::Checkbox::without_text(&mut on)).changed() {
-                                toggle(&mut picked, &g.key, on);
-                            }
-                            ui.label(&g.key).on_hover_text(g.paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"));
-                            ui.label(human_bytes(g.bytes));
-                            if g.extras.is_empty() {
-                                ui.label("");
-                            } else {
-                                ui.label(RichText::new(format!("+ {} updates/DLC", g.extras.len())).small().color(ACCENT))
-                                    .on_hover_text(g.extras.join("\n"));
-                            }
-                            ui.end_row();
-                        }
+                let row_h = ui.spacing().interact_size.y;
+                let gap = ui.spacing().item_spacing.y;
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .max_height(ui.available_height() - footer)
+                    .show_rows(ui, row_h, visible.len(), |ui, range| {
+                        egui::Grid::new("games")
+                            .striped(true)
+                            .num_columns(4)
+                            .spacing([14.0, gap])
+                            .min_row_height(row_h)
+                            .start_row(range.start)
+                            .show(ui, |ui| {
+                                for g in &visible[range] {
+                                    let mut on = picked.contains(&g.key);
+                                    if ui.add_enabled(!busy, egui::Checkbox::without_text(&mut on)).changed() {
+                                        toggle(&mut picked, &g.key, on);
+                                    }
+                                    ui.label(&g.key).on_hover_text(g.paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"));
+                                    ui.label(human_bytes(g.bytes));
+                                    if g.extras.is_empty() {
+                                        ui.label("");
+                                    } else {
+                                        ui.label(RichText::new(format!("+ {} updates/DLC", g.extras.len())).small().color(ACCENT))
+                                            .on_hover_text(g.extras.join("\n"));
+                                    }
+                                    ui.end_row();
+                                }
+                            });
                     });
-                });
                 ui.separator();
                 if ui.button("Done").clicked() {
                     done = true;
@@ -1885,11 +1896,21 @@ impl App {
         }
 
         egui::CollapsingHeader::new(format!("Log ({})", self.log.len())).id_salt("log").show(ui, |ui| {
-            egui::ScrollArea::vertical().max_height(160.0).stick_to_bottom(true).id_salt("log_scroll").show(ui, |ui| {
-                for l in &self.log {
-                    ui.label(RichText::new(l).small());
-                }
-            });
+            if ui.small_button("Copy log").on_hover_text("Copy the whole log to the clipboard").clicked() {
+                ui.ctx().copy_text(self.log.join("\n"));
+            }
+            let row_h = ui.text_style_height(&egui::TextStyle::Small);
+            egui::ScrollArea::vertical().max_height(160.0).stick_to_bottom(true).id_salt("log_scroll").show_rows(
+                ui,
+                row_h,
+                self.log.len(),
+                |ui, range| {
+                    for l in &self.log[range] {
+                        // one row per line: long lines are cut with … and shown in full on hover
+                        ui.add(egui::Label::new(RichText::new(l).small()).truncate());
+                    }
+                },
+            );
         });
         ui.add_space(4.0);
     }
