@@ -81,9 +81,9 @@ impl Cache {
     }
 }
 
-/// `<config dir>\EMUAssistant\http_cache.json`
+/// `http_cache.json` in the config folder ([`crate::config::app_dir`]).
 pub fn cache_path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("EMUAssistant").join("http_cache.json"))
+    Some(crate::config::app_dir()?.join("http_cache.json"))
 }
 
 /// Where a download's resume information is kept: `<part>.json`.

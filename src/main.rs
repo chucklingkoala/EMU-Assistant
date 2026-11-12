@@ -53,6 +53,10 @@ fn main() -> anyhow::Result<()> {
             .context("usage: EMUAssistant --check-updates <ES-DE folder>")?;
         return update::print_check(&root, &config::load().update_opts(&root));
     }
+    if args.get(1).map(String::as_str) == Some("--export") {
+        attach_console();
+        std::process::exit(headless_export(&args[2..]));
+    }
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(APP_NAME)
@@ -64,6 +68,48 @@ fn main() -> anyhow::Result<()> {
     let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(APP_NAME, options, Box::new(|cc| Ok(Box::new(ui::App::new(cc)))))
         .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+const EXPORT_USAGE: &str = "usage: EMUAssistant --export [--profile NAME] [--dest PATH] [ES-DE folder]";
+
+/// `--export`: exit code 0 when done, 1 when files failed, 2 when it could not start.
+fn headless_export(args: &[String]) -> i32 {
+    let mut h = export::Headless::default();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--profile" => h.profile = it.next().cloned(),
+            "--dest" => h.dest = it.next().map(PathBuf::from),
+            "--help" | "-h" => {
+                println!("{EXPORT_USAGE}");
+                return 0;
+            }
+            s if s.starts_with("--") => {
+                eprintln!("unknown option {s}\n{EXPORT_USAGE}");
+                return 2;
+            }
+            s => h.es_root = Some(PathBuf::from(s)),
+        }
+    }
+    let log = std::sync::Mutex::new(export::log_file());
+    let out = |s: String| {
+        println!("{s}");
+        if let Some((_, f)) = log.lock().unwrap().as_mut() {
+            use std::io::Write;
+            let _ = writeln!(f, "{s}");
+        }
+    };
+    if let Some((p, _)) = log.lock().unwrap().as_ref() {
+        println!("Log: {}", p.display());
+    }
+    match export::headless(&h, config::load(), &out) {
+        Ok(r) if r.failed.is_empty() => 0,
+        Ok(_) => 1,
+        Err(e) => {
+            out(format!("Not started: {}", e.0));
+            2
+        }
+    }
 }
 
 /// Release builds use the GUI subsystem; reattach to the parent console for `--dump`.

@@ -153,17 +153,32 @@ pub fn default_backup_dir(es_root: &Path) -> PathBuf {
     es_root.join(crate::manifest::DIR).join("backups")
 }
 
-fn path_in(dir: &str) -> Option<PathBuf> {
+/// Set to a folder to keep the config, logs and cache there instead of `%APPDATA%\EMUAssistant`.
+pub const DIR_ENV: &str = "EMUASSISTANT_CONFIG_DIR";
+
+/// `%APPDATA%\EMUAssistant`, or the folder in [`DIR_ENV`].
+pub fn app_dir() -> Option<PathBuf> {
+    match std::env::var_os(DIR_ENV).filter(|v| !v.is_empty()) {
+        Some(d) => Some(PathBuf::from(d)),
+        None => Some(dirs::config_dir()?.join("EMUAssistant")),
+    }
+}
+
+/// A config folder of an earlier version; not looked at when [`DIR_ENV`] is set.
+fn legacy_path(dir: &str) -> Option<PathBuf> {
+    if std::env::var_os(DIR_ENV).is_some_and(|v| !v.is_empty()) {
+        return None;
+    }
     Some(dirs::config_dir()?.join(dir).join("config.json"))
 }
 
 fn path() -> Option<PathBuf> {
-    path_in("EMUAssistant")
+    Some(app_dir()?.join("config.json"))
 }
 
 /// Loads the config, falling back to the ones written by earlier versions.
 pub fn load() -> Config {
-    [path(), path_in("EMU Assistant"), path_in("EMUAsist")]
+    [path(), legacy_path("EMU Assistant"), legacy_path("EMUAsist")]
         .into_iter()
         .flatten()
         .find_map(|p| std::fs::read_to_string(p).ok())
