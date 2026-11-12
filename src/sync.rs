@@ -2,6 +2,7 @@
 //! run never leaves a half-written file under its real name, and stamps the source
 //! modification time so the next run can skip unchanged files.
 
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ use crossbeam_channel::Sender;
 use filetime::FileTime;
 
 use crate::fsutil::PART_EXT;
-use crate::paths::long;
+use crate::paths::{eq_ci, is_under, key, long};
 use crate::plan::Plan;
 
 #[derive(Clone, Debug, Default)]
@@ -144,6 +145,18 @@ fn is_fatal(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::StorageFull || matches!(e.raw_os_error(), Some(21 | 39 | 112 | 1167))
 }
 
+/// Removes the folders that deleting `file` left empty, up to but not including `root`.
+/// Folders that exist in the source (`keep`, lowercase keys) stay even when empty.
+fn remove_emptied_dirs(file: &Path, root: &Path, keep: &HashSet<String>) {
+    let mut dir = file.parent();
+    while let Some(d) = dir {
+        if eq_ci(d, root) || !is_under(d, root) || keep.contains(&key(d)) || fs::remove_dir(long(d)).is_err() {
+            break;
+        }
+        dir = d.parent();
+    }
+}
+
 pub fn execute(plan: &Plan, verify: bool, cancel: &AtomicBool, tx: &Sender<Event>) -> Report {
     let start = Instant::now();
     let mut report = Report::default();
@@ -212,9 +225,15 @@ pub fn execute(plan: &Plan, verify: bool, cancel: &AtomicBool, tx: &Sender<Event
     }
 
     if !report.cancelled && !stopped {
+        let keep: HashSet<String> = plan.dirs.iter().map(|d| key(d)).collect();
         for p in &plan.prune {
             match fs::remove_file(long(p)) {
-                Ok(()) => report.pruned += 1,
+                Ok(()) => {
+                    report.pruned += 1;
+                    if let Some(root) = plan.prune_roots.iter().find(|r| is_under(p, r)) {
+                        remove_emptied_dirs(p, root, &keep);
+                    }
+                }
                 Err(e) => report.failed.push(format!("delete {}: {e}", p.display())),
             }
         }
@@ -326,5 +345,29 @@ mod tests {
         assert!(r.is_err());
         assert!(!part_path(&dst).exists());
         assert!(dst.join("sub").is_dir());
+    }
+
+    #[test]
+    fn prune_removes_emptied_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("drive");
+        fs::create_dir_all(src.join("keep")).unwrap();
+        fs::create_dir_all(src.join(r"gone\sub")).unwrap();
+        fs::write(src.join(r"keep\a.bin"), b"a").unwrap();
+        fs::write(src.join(r"gone\sub\b.bin"), b"b").unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let no = AtomicBool::new(false);
+        execute(&plan_for(&src, &dest, OPTS.clone()), false, &no, &tx);
+        let gone_dst = crate::paths::mirror(&dest, &src.join("gone"));
+        assert!(gone_dst.join(r"sub\b.bin").is_file());
+
+        fs::remove_dir_all(src.join("gone")).unwrap();
+        let p = plan_for(&src, &dest, PlanOptions { protect_newer: true, prune: true });
+        assert_eq!(p.prune.len(), 1);
+        let r = execute(&p, false, &no, &tx);
+        assert_eq!((r.pruned, r.failed.len()), (1, 0));
+        assert!(!gone_dst.exists(), "the emptied game folder is removed");
+        assert!(crate::paths::mirror(&dest, &src.join(r"keep\a.bin")).is_file());
     }
 }
