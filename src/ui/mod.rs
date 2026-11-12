@@ -771,7 +771,7 @@ impl App {
 
     fn poll_job(&mut self) {
         let Some(job) = self.job.take() else { return };
-        self.job = match job {
+        let next = match job {
             Job::Scan { rx, cancel } => match drain(&rx, &mut self.status) {
                 None => Some(Job::Scan { rx, cancel }),
                 Some(Ok(cat)) => {
@@ -887,6 +887,10 @@ impl App {
                 }
             }
         };
+        // a finished job may have started the next one (the re-analyze after a copy): keep it
+        if next.is_some() {
+            self.job = next;
+        }
     }
 
     fn finish_copy(&mut self, r: Report, after: After) {
