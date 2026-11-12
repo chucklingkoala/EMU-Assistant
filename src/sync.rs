@@ -6,7 +6,8 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
@@ -14,7 +15,7 @@ use filetime::FileTime;
 
 use crate::fsutil::PART_EXT;
 use crate::paths::{eq_ci, is_under, key, long};
-use crate::plan::Plan;
+use crate::plan::{Plan, PlanItem};
 
 #[derive(Clone, Debug, Default)]
 pub struct Progress {
@@ -43,6 +44,29 @@ pub enum Event {
 
 const BUF: usize = 4 << 20;
 
+/// Files smaller than this are copied on [`SMALL_WORKERS`] threads at once. For tens of
+/// thousands of small media files the time goes into opening, flushing and renaming
+/// each file, not into the bytes, and that waiting overlaps well.
+pub const SMALL_MAX: u64 = 1 << 20;
+const SMALL_WORKERS: usize = 4;
+
+/// Copy buffers, allocated once per thread instead of once per file.
+#[derive(Default)]
+pub struct Bufs {
+    a: Vec<u8>,
+    b: Vec<u8>,
+}
+
+impl Bufs {
+    fn get(&mut self) -> (&mut [u8], &mut [u8]) {
+        if self.a.len() < BUF {
+            self.a = vec![0u8; BUF];
+            self.b = vec![0u8; BUF];
+        }
+        (&mut self.a, &mut self.b)
+    }
+}
+
 fn part_path(dst: &Path) -> PathBuf {
     let mut s = dst.as_os_str().to_owned();
     s.push(PART_EXT);
@@ -60,12 +84,25 @@ pub fn copy_file(
     cancel: &AtomicBool,
     on_bytes: &mut dyn FnMut(u64),
 ) -> io::Result<bool> {
+    copy_file_buf(src, dst, mtime, verify, cancel, &mut Bufs::default(), on_bytes)
+}
+
+/// [`copy_file`] with buffers the caller keeps between files.
+pub fn copy_file_buf(
+    src: &Path,
+    dst: &Path,
+    mtime: FileTime,
+    verify: bool,
+    cancel: &AtomicBool,
+    bufs: &mut Bufs,
+    on_bytes: &mut dyn FnMut(u64),
+) -> io::Result<bool> {
     let (src, dst) = (long(src), long(dst));
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
     }
     let part = part_path(&dst);
-    let res = write_part(&src, &part, mtime, verify, cancel, on_bytes).and_then(|done| {
+    let res = write_part(&src, &part, mtime, verify, cancel, bufs, on_bytes).and_then(|done| {
         if done {
             if let Ok(m) = fs::metadata(&dst) {
                 let mut p = m.permissions();
@@ -92,16 +129,17 @@ fn write_part(
     mtime: FileTime,
     verify: bool,
     cancel: &AtomicBool,
+    bufs: &mut Bufs,
     on_bytes: &mut dyn FnMut(u64),
 ) -> io::Result<bool> {
     let mut r = File::open(src)?;
     let mut w = File::create(part)?;
-    let mut buf = vec![0u8; BUF];
+    let (buf, _) = bufs.get();
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Ok(false);
         }
-        let n = r.read(&mut buf)?;
+        let n = r.read(buf)?;
         if n == 0 {
             break;
         }
@@ -110,7 +148,7 @@ fn write_part(
     }
     w.sync_all()?;
     drop(w);
-    if verify && !same_content(src, part)? {
+    if verify && !same_content_buf(src, part, bufs)? {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "verification failed: the copy differs from the source"));
     }
     filetime::set_file_mtime(part, mtime)?;
@@ -119,13 +157,17 @@ fn write_part(
 
 /// Byte-for-byte comparison of two files.
 pub fn same_content(a: &Path, b: &Path) -> io::Result<bool> {
+    same_content_buf(a, b, &mut Bufs::default())
+}
+
+fn same_content_buf(a: &Path, b: &Path, bufs: &mut Bufs) -> io::Result<bool> {
     let (mut fa, mut fb) = (File::open(long(a))?, File::open(long(b))?);
     if fa.metadata()?.len() != fb.metadata()?.len() {
         return Ok(false);
     }
-    let (mut ba, mut bb) = (vec![0u8; BUF], vec![0u8; BUF]);
+    let (ba, bb) = bufs.get();
     loop {
-        let n = fa.read(&mut ba)?;
+        let n = fa.read(ba)?;
         if n == 0 {
             return Ok(true);
         }
@@ -157,74 +199,149 @@ fn remove_emptied_dirs(file: &Path, root: &Path, keep: &HashSet<String>) {
     }
 }
 
-pub fn execute(plan: &Plan, verify: bool, cancel: &AtomicBool, tx: &Sender<Event>) -> Report {
-    let start = Instant::now();
-    let mut report = Report::default();
-    let log = |s: String| {
-        let _ = tx.send(Event::Log(s));
-    };
-    for d in &plan.dirs {
-        if let Err(e) = fs::create_dir_all(long(d)) {
-            log(format!("Could not create {}: {e}", d.display()));
-        }
+/// State of one [`execute`] run, shared by the copy threads.
+struct Run<'a> {
+    verify: bool,
+    cancel: &'a AtomicBool,
+    tx: &'a Sender<Event>,
+    total_bytes: u64,
+    total_files: u64,
+    done_bytes: AtomicU64,
+    done_files: AtomicU64,
+    last_progress: Mutex<Instant>,
+    consecutive: AtomicU32,
+    /// A fatal error or too many failures in a row: no more files are started.
+    stopped: AtomicBool,
+    cancelled: AtomicBool,
+    report: Mutex<Report>,
+}
+
+impl Run<'_> {
+    fn log(&self, s: String) {
+        let _ = self.tx.send(Event::Log(s));
     }
 
-    let total_bytes = plan.copy_bytes;
-    let total_files = plan.copy.len() as u64;
-    let mut done = 0u64;
-    let mut last = Instant::now() - Duration::from_secs(1);
-    let mut consecutive = 0u32;
-    let mut stopped = false;
-    for (i, item) in plan.copy.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            report.cancelled = true;
-            break;
+    /// Sends a progress event at most every 100 ms, from whichever thread gets there.
+    fn progress(&self, current: &Path) {
+        let Ok(mut last) = self.last_progress.try_lock() else { return };
+        if last.elapsed() < Duration::from_millis(100) {
+            return;
+        }
+        *last = Instant::now();
+        let _ = self.tx.send(Event::Progress(Progress {
+            done_bytes: self.done_bytes.load(Ordering::Relaxed),
+            total_bytes: self.total_bytes,
+            done_files: self.done_files.load(Ordering::Relaxed),
+            total_files: self.total_files,
+            current: current.display().to_string(),
+        }));
+    }
+
+    /// Copies one item. Returns false when the run must not start another file.
+    fn copy(&self, item: &PlanItem, bufs: &mut Bufs) -> bool {
+        if self.stopped.load(Ordering::Relaxed) {
+            return false;
+        }
+        if self.cancel.load(Ordering::Relaxed) {
+            self.cancelled.store(true, Ordering::Relaxed);
+            return false;
         }
         let mut file_done = 0u64;
-        let res = copy_file(&item.src, &item.dst, item.mtime, verify, cancel, &mut |n| {
+        let res = copy_file_buf(&item.src, &item.dst, item.mtime, self.verify, self.cancel, bufs, &mut |n| {
             file_done += n;
-            if last.elapsed() >= Duration::from_millis(100) {
-                last = Instant::now();
-                let _ = tx.send(Event::Progress(Progress {
-                    done_bytes: done + file_done,
-                    total_bytes,
-                    done_files: i as u64,
-                    total_files,
-                    current: item.dst.display().to_string(),
-                }));
-            }
+            self.done_bytes.fetch_add(n, Ordering::Relaxed);
+            self.progress(&item.dst);
         });
         match res {
             Ok(true) => {
-                consecutive = 0;
-                report.copied += 1;
-                report.copied_bytes += item.size;
+                self.consecutive.store(0, Ordering::Relaxed);
+                let mut r = self.report.lock().unwrap();
+                r.copied += 1;
+                r.copied_bytes += item.size;
             }
             Ok(false) => {
-                report.cancelled = true;
-                break;
+                self.cancelled.store(true, Ordering::Relaxed);
+                return false;
             }
             Err(e) => {
-                report.failed.push(format!("{}: {e}", item.src.display()));
-                log(format!("Failed {}: {e}", item.src.display()));
-                consecutive += 1;
-                if is_fatal(&e) || consecutive >= MAX_CONSECUTIVE_FAILURES {
-                    let why = if is_fatal(&e) {
-                        format!("Stopped: {e}. The remaining files were not copied.")
-                    } else {
-                        format!("Stopped after {consecutive} failed files in a row. Is the drive still connected?")
-                    };
-                    report.failed.push(why.clone());
-                    log(why);
-                    stopped = true;
-                    break;
+                let msg = format!("{}: {e}", item.src.display());
+                self.log(format!("Failed {msg}"));
+                self.report.lock().unwrap().failed.push(msg);
+                let n = self.consecutive.fetch_add(1, Ordering::Relaxed) + 1;
+                if is_fatal(&e) || n >= MAX_CONSECUTIVE_FAILURES {
+                    // the first thread to stop explains why
+                    if !self.stopped.swap(true, Ordering::Relaxed) {
+                        let why = if is_fatal(&e) {
+                            format!("Stopped: {e}. The remaining files were not copied.")
+                        } else {
+                            format!("Stopped after {n} failed files in a row. Is the drive still connected?")
+                        };
+                        self.report.lock().unwrap().failed.push(why.clone());
+                        self.log(why);
+                    }
+                    return false;
                 }
             }
         }
-        done += item.size;
+        // count the whole file, also when it failed half-way, so the bar keeps moving
+        self.done_bytes.fetch_add(item.size.saturating_sub(file_done), Ordering::Relaxed);
+        self.done_files.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+}
+
+pub fn execute(plan: &Plan, verify: bool, cancel: &AtomicBool, tx: &Sender<Event>) -> Report {
+    let start = Instant::now();
+    for d in &plan.dirs {
+        if let Err(e) = fs::create_dir_all(long(d)) {
+            let _ = tx.send(Event::Log(format!("Could not create {}: {e}", d.display())));
+        }
+    }
+    let run = Run {
+        verify,
+        cancel,
+        tx,
+        total_bytes: plan.copy_bytes,
+        total_files: plan.copy.len() as u64,
+        done_bytes: AtomicU64::new(0),
+        done_files: AtomicU64::new(0),
+        last_progress: Mutex::new(Instant::now() - Duration::from_secs(1)),
+        consecutive: AtomicU32::new(0),
+        stopped: AtomicBool::new(false),
+        cancelled: AtomicBool::new(false),
+        report: Mutex::new(Report::default()),
+    };
+
+    // small files on several threads first, then the large ones one at a time
+    let (small, large): (Vec<&PlanItem>, Vec<&PlanItem>) = plan.copy.iter().partition(|i| i.size < SMALL_MAX);
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..SMALL_WORKERS.min(small.len()) {
+            s.spawn(|| {
+                let mut bufs = Bufs::default();
+                while let Some(item) = small.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    if !run.copy(item, &mut bufs) {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    let mut bufs = Bufs::default();
+    for item in large {
+        if !run.copy(item, &mut bufs) {
+            break;
+        }
+    }
+    // a cancel that came between two files
+    if cancel.load(Ordering::Relaxed) && run.done_files.load(Ordering::Relaxed) < run.total_files {
+        run.cancelled.store(true, Ordering::Relaxed);
     }
 
-    if !report.cancelled && !stopped {
+    let (cancelled, stopped) = (run.cancelled.load(Ordering::Relaxed), run.stopped.load(Ordering::Relaxed));
+    let mut report = std::mem::take(&mut *run.report.lock().unwrap());
+    report.cancelled = cancelled;
+    if !cancelled && !stopped {
         let keep: HashSet<String> = plan.dirs.iter().map(|d| key(d)).collect();
         for p in &plan.prune {
             match fs::remove_file(long(p)) {
@@ -239,10 +356,10 @@ pub fn execute(plan: &Plan, verify: bool, cancel: &AtomicBool, tx: &Sender<Event
         }
     }
     let _ = tx.send(Event::Progress(Progress {
-        done_bytes: done,
-        total_bytes,
+        done_bytes: run.done_bytes.load(Ordering::Relaxed),
+        total_bytes: run.total_bytes,
         done_files: report.copied,
-        total_files,
+        total_files: run.total_files,
         current: String::new(),
     }));
     report.elapsed = start.elapsed();
@@ -369,5 +486,105 @@ mod tests {
         assert_eq!((r.pruned, r.failed.len()), (1, 0));
         assert!(!gone_dst.exists(), "the emptied game folder is removed");
         assert!(crate::paths::mirror(&dest, &src.join(r"keep\a.bin")).is_file());
+    }
+
+    #[test]
+    fn copies_many_small_and_some_large_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("drive");
+        for i in 0..500 {
+            let p = src.join(format!(r"d{}\f{i}.bin", i % 7));
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, format!("small {i}")).unwrap();
+        }
+        let big = vec![7u8; SMALL_MAX as usize + 10];
+        fs::write(src.join("big1.bin"), &big).unwrap();
+        fs::write(src.join("big2.bin"), &big).unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let p = plan_for(&src, &dest, OPTS.clone());
+        assert_eq!(p.copy.len(), 502);
+        let r = execute(&p, true, &AtomicBool::new(false), &tx);
+        assert_eq!((r.copied, r.copied_bytes, r.failed.len(), r.cancelled), (502, p.copy_bytes, 0, false));
+        for item in &p.copy {
+            assert_eq!(fs::read(&item.dst).unwrap(), fs::read(&item.src).unwrap());
+            let t = FileTime::from_last_modification_time(&fs::metadata(&item.dst).unwrap());
+            assert_eq!(t.unix_seconds(), item.mtime.unix_seconds());
+        }
+        // the last progress event reports everything done
+        let last = rx.try_iter().filter_map(|e| if let Event::Progress(p) = e { Some(p) } else { None }).last().unwrap();
+        assert_eq!((last.done_bytes, last.done_files), (p.copy_bytes, 502));
+        assert_eq!(plan_for(&src, &dest, OPTS.clone()).copy.len(), 0);
+    }
+
+    #[test]
+    fn small_file_failures_are_reported_and_the_rest_copied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("drive");
+        fs::create_dir_all(&src).unwrap();
+        for i in 0..50 {
+            fs::write(src.join(format!("f{i}.bin")), b"x").unwrap();
+        }
+        let p = plan_for(&src, &dest, OPTS.clone());
+        // a non-empty folder where three of the files should go: their rename fails
+        for i in [3, 17, 41] {
+            fs::create_dir_all(crate::paths::mirror(&dest, &src.join(format!(r"f{i}.bin\sub")))).unwrap();
+        }
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let r = execute(&p, false, &AtomicBool::new(false), &tx);
+        assert_eq!((r.copied, r.failed.len()), (47, 3), "{:?}", r.failed);
+    }
+
+    #[test]
+    fn cancel_during_small_files_leaves_no_part_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("drive");
+        fs::create_dir_all(&src).unwrap();
+        for i in 0..400 {
+            fs::write(src.join(format!("f{i}.bin")), vec![1u8; 2000]).unwrap();
+        }
+        let p = plan_for(&src, &dest, OPTS.clone());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let cancel = AtomicBool::new(false);
+        let r = std::thread::scope(|s| {
+            let h = s.spawn(|| execute(&p, false, &cancel, &tx));
+            // cancel as soon as the first progress event arrives
+            let _ = rx.recv();
+            cancel.store(true, Ordering::Relaxed);
+            h.join().unwrap()
+        });
+        assert!(r.cancelled || r.copied == 400);
+        let parts = walkdir::WalkDir::new(&dest).into_iter().flatten().filter(|e| e.path().to_string_lossy().ends_with(PART_EXT)).count();
+        assert_eq!(parts, 0);
+    }
+
+    /// Copies 20,000 files of 2 KB into `EMU_BENCH_DIR` and prints files per second:
+    /// `set EMU_BENCH_DIR=E:\bench` then `cargo test --release bench_small_files -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_small_files() {
+        let Ok(dir) = std::env::var("EMU_BENCH_DIR") else {
+            eprintln!("set EMU_BENCH_DIR to a folder on the drive to measure");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("bench_src");
+        for i in 0..20_000 {
+            let p = src.join(format!(r"d{}\f{i}.png", i % 100));
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, vec![(i % 251) as u8; 2048]).unwrap();
+        }
+        let dest = crate::paths::normalize(Path::new(&dir)).join("emuasist-bench");
+        let _ = fs::remove_dir_all(&dest);
+        let p = plan_for(&src, &dest, OPTS.clone());
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        assert_eq!(p.copy.len(), 20_000, "{:?}", p.warnings);
+        let r = execute(&p, false, &AtomicBool::new(false), &tx);
+        assert!(r.failed.is_empty(), "{:?}", r.failed.first());
+        let secs = r.elapsed.as_secs_f64();
+        println!("{} files in {secs:.1} s: {:.0} files/s", r.copied, r.copied as f64 / secs);
+        let _ = fs::remove_dir_all(&dest);
     }
 }
