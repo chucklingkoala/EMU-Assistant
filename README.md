@@ -123,7 +123,7 @@ If the ROM or media folder ends up somewhere different from the main machine, EM
 3. **Tick the programs to update.** Nothing is ticked for you. *Tick all with updates* ticks only the programs with a known newer version. For RetroArch, cores that have newer builds are updated along with it.
 4. Press **Update selected**. For each program EMU Assistant downloads the release, unpacks it, saves every file it is about to replace in a backup zip, then installs. If anything goes wrong mid-way, the backup is put back automatically.
 
-What's never overwritten: existing `.ini`, `.cfg` and `.yml` files, `portable.txt`, RetroArch's `config`, `saves`, `states`, `system`, `playlists` and `screenshots` folders, and ES-DE's own `ES-DE`, `ROMs` and `Emulators` folders.
+What's never overwritten: existing `.ini`, `.cfg`, `.yml` and `.toml` files, `portable.txt`, RetroArch's `config`, `saves`, `states`, `system`, `playlists` and `screenshots` folders, and ES-DE's own `ES-DE`, `ROMs` and `Emulators` folders.
 
 <img src="docs/images/restore.png" alt="Restore window with one backup partly ticked" width="900">
 

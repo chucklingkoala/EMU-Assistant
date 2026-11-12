@@ -195,7 +195,11 @@ fn entries(dir: &Path, rel: &Path, inner_ids: bool) -> Vec<Entry> {
                 return None;
             }
             let path = dir.join(&name);
-            let meta = std::fs::metadata(long(&path)).ok()?;
+            // the directory listing already carries type and size; only links need a second look
+            let meta = match e.metadata() {
+                Ok(m) if !m.file_type().is_symlink() => m,
+                _ => std::fs::metadata(long(&path)).ok()?,
+            };
             let mut entry = Entry { rel: rel.join(&name), is_dir: meta.is_dir(), files: 0, bytes: 0, inner_ids: Vec::new(), name };
             if meta.is_dir() {
                 let mut errors = Vec::new();

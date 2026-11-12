@@ -222,6 +222,13 @@ pub struct RestoreResult {
     pub failed: Vec<String>,
 }
 
+/// A path from backup.json must stay inside the install folder: plain names only,
+/// no drive, no leading separator, no `..`.
+fn safe_rel(rel: &str) -> bool {
+    use std::path::Component;
+    !rel.is_empty() && Path::new(rel).components().all(|c| matches!(c, Component::Normal(_)))
+}
+
 /// Puts the saved files back and deletes the files the update added. `only` limits the
 /// restore to those relative paths (from `replaced` or `added`).
 pub fn restore(zip_path: &Path, only: Option<&BTreeSet<String>>, cancel: &AtomicBool) -> Result<RestoreResult> {
@@ -230,6 +237,10 @@ pub fn restore(zip_path: &Path, only: Option<&BTreeSet<String>>, cancel: &Atomic
     let wanted = |p: &str| only.is_none_or(|o| o.contains(p));
     let mut res = RestoreResult::default();
     for f in meta.replaced.iter().filter(|f| wanted(&f.path)) {
+        if !safe_rel(&f.path) {
+            res.failed.push(format!("{}: unsafe path in the backup, skipped", f.path));
+            continue;
+        }
         if cancel.load(Ordering::Relaxed) {
             bail!("cancelled");
         }
@@ -256,6 +267,10 @@ pub fn restore(zip_path: &Path, only: Option<&BTreeSet<String>>, cancel: &Atomic
         }
     }
     for rel in meta.added.iter().filter(|p| wanted(p)) {
+        if !safe_rel(rel) {
+            res.failed.push(format!("{rel}: unsafe path in the backup, skipped"));
+            continue;
+        }
         let p = meta.dir.join(rel);
         match fs::remove_file(long(&p)) {
             Ok(()) => {
@@ -357,5 +372,16 @@ pub(crate) mod tests {
         assert_eq!((r.restored, r.removed, r.failed.len()), (2, 1, 0));
         assert_eq!(fs::read(dir.join(r"sub\b.dat")).unwrap(), b"old b");
         assert!(!dir.join("new").exists());
+    }
+
+    #[test]
+    fn rejects_paths_that_leave_the_install_folder() {
+        assert!(safe_rel(r"sub\b.dat"));
+        assert!(safe_rel("a.dll"));
+        assert!(!safe_rel(r"..\evil.dll"));
+        assert!(!safe_rel(r"sub\..\..\evil.dll"));
+        assert!(!safe_rel(r"C:\Windows\x.dll"));
+        assert!(!safe_rel(r"\x.dll"));
+        assert!(!safe_rel(""));
     }
 }

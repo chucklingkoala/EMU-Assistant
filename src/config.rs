@@ -108,10 +108,12 @@ pub fn load() -> Config {
 }
 
 pub fn save(cfg: &Config) {
-    if let Some(p) = path() {
-        let _ = std::fs::create_dir_all(p.parent().unwrap());
-        if let Ok(s) = serde_json::to_string_pretty(cfg) {
-            let _ = std::fs::write(p, s);
-        }
+    let Some(p) = path() else { return };
+    let _ = std::fs::create_dir_all(p.parent().unwrap());
+    let Ok(s) = serde_json::to_string_pretty(cfg) else { return };
+    // write a temp file first so a crash can't leave a half-written config
+    let tmp = p.with_extension("json.tmp");
+    if std::fs::write(&tmp, s).is_ok() {
+        let _ = std::fs::rename(&tmp, &p);
     }
 }

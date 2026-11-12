@@ -393,7 +393,7 @@ pub fn protected(id: &str, rel: &Path, exists: bool) -> bool {
     }
     let name = rel.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
     let ext = rel.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    if name == version::MARKER.to_lowercase() || name == "portable.txt" || ["ini", "cfg", "yml", "yaml"].contains(&ext.as_str()) {
+    if name == version::MARKER.to_lowercase() || name == "portable.txt" || ["ini", "cfg", "yml", "yaml", "toml"].contains(&ext.as_str()) {
         return true;
     }
     is_retroarch_id(id) && multi && ["config", "saves", "states", "system", "playlists", "screenshots", "logs"].contains(&first.as_str())
@@ -795,6 +795,8 @@ mod tests {
     fn protects_user_files() {
         assert!(protected("RETROARCH", Path::new("retroarch.cfg"), true));
         assert!(!protected("RETROARCH", Path::new("retroarch.cfg"), false));
+        assert!(protected("XEMU", Path::new("xemu.toml"), true));
+        assert!(!protected("XEMU", Path::new("xemu.toml"), false));
         assert!(protected("RETROARCH", Path::new(r"saves\a.srm"), true));
         assert!(!protected("RETROARCH", Path::new(r"assets\x.png"), true));
         assert!(protected(ESDE_ID, Path::new(r"ROMs\snes\systeminfo.txt"), false));

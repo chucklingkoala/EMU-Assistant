@@ -45,5 +45,6 @@ tempfile = "3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [profile.release]
+codegen-units = 1
 lto = true
 strip = true

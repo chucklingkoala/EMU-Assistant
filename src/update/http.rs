@@ -68,27 +68,31 @@ impl Http {
         let mut part = dest.as_os_str().to_owned();
         part.push(PART_EXT);
         let part = std::path::PathBuf::from(part);
-        let resp = self.get(url)?;
-        let mut reader = resp.into_body().into_with_config().limit(u64::MAX).reader();
-        let mut out = File::create(&part).with_context(|| format!("creating {}", part.display()))?;
-        let mut buf = vec![0u8; 1 << 20];
-        loop {
-            if cancel.load(Ordering::Relaxed) {
-                drop(out);
-                let _ = fs::remove_file(&part);
-                return Ok(false);
+        let res = (|| -> Result<bool> {
+            let resp = self.get(url)?;
+            let mut reader = resp.into_body().into_with_config().limit(u64::MAX).reader();
+            let mut out = File::create(&part).with_context(|| format!("creating {}", part.display()))?;
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return Ok(false);
+                }
+                let n = reader.read(&mut buf).with_context(|| format!("downloading {url}"))?;
+                if n == 0 {
+                    break;
+                }
+                out.write_all(&buf[..n])?;
+                on_bytes(n as u64);
             }
-            let n = reader.read(&mut buf).with_context(|| format!("downloading {url}"))?;
-            if n == 0 {
-                break;
-            }
-            out.write_all(&buf[..n])?;
-            on_bytes(n as u64);
+            out.sync_all()?;
+            drop(out);
+            fs::rename(&part, dest)?;
+            Ok(true)
+        })();
+        if !matches!(res, Ok(true)) {
+            let _ = fs::remove_file(&part);
         }
-        out.sync_all()?;
-        drop(out);
-        fs::rename(&part, dest)?;
-        Ok(true)
+        res
     }
 }
 
