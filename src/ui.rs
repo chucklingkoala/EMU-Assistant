@@ -1546,13 +1546,20 @@ impl App {
                     });
                 });
                 ui.separator();
-                // leave room for the separator and the Done button below
-                let footer = ui.spacing().interact_size.y + ui.spacing().item_spacing.y * 3.0;
+                // Done goes in a bottom panel first, so the list gets exactly the space that is
+                // left and can't push the button out of the window (the theme's button padding
+                // made a hand-computed footer height come out a few pixels short)
+                egui::TopBottomPanel::bottom("games_footer")
+                    .frame(egui::Frame::none().inner_margin(egui::Margin { top: 6.0, ..Default::default() }))
+                    .show_inside(ui, |ui| {
+                        if ui.button("Done").clicked() {
+                            done = true;
+                        }
+                    });
                 let row_h = ui.spacing().interact_size.y;
                 let gap = ui.spacing().item_spacing.y;
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .max_height(ui.available_height() - footer)
                     .show_rows(ui, row_h, visible.len(), |ui, range| {
                         egui::Grid::new("games")
                             .striped(true)
@@ -1578,10 +1585,6 @@ impl App {
                                 }
                             });
                     });
-                ui.separator();
-                if ui.button("Done").clicked() {
-                    done = true;
-                }
             });
         if picked != before {
             self.set_games(&name, picked, all.len());
