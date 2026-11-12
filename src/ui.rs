@@ -498,6 +498,7 @@ impl App {
         });
         self.export_cat = None;
         self.plan = None;
+        self.report = None;
         self.status = "Scanning…".into();
         self.job = Some(Job::Scan { rx, cancel });
     }
@@ -1785,6 +1786,11 @@ impl App {
             }
         }
 
+        if let (false, Some(r)) = (busy, &self.report) {
+            if !r.failed.is_empty() {
+                ui.colored_label(BAD, format!("⚠ The last run had {} errors. Open the log below for details.", r.failed.len()));
+            }
+        }
         self.ui_progress_and_log(ui, busy, "file");
     }
 
