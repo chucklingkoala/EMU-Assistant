@@ -206,14 +206,32 @@ fn no_asset(spec: &SourceSpec) -> anyhow::Error {
 fn github(http: &Http, spec: &SourceSpec) -> Result<Release> {
     let repo = spec.repo.trim().trim_matches('/');
     let api = format!("https://api.github.com/repos/{repo}/releases");
-    // /latest is the newest stable release; it 404s for projects without one
-    if let Ok(rel) = http.get_json(&format!("{api}/latest")) {
-        if let Some(r) = from_release(&rel, &spec.asset) {
+    // /latest is the newest stable release; it 404s for projects without one, and then
+    // the list (rolling builds) is needed. Asking the one that worked last time first
+    // saves a request per program, which matters with 60 requests an hour.
+    let latest = || http.get_json(&format!("{api}/latest")).ok().and_then(|rel| from_release(&rel, &spec.asset));
+    let list = || -> Result<Option<Release>> {
+        let list: Vec<Value> = serde_json::from_value(http.get_json(&format!("{api}?per_page=15"))?)?;
+        Ok(pick_release(&list, &spec.asset))
+    };
+    let list_first = http.github_endpoint(repo).as_deref() == Some("list");
+    if !list_first {
+        if let Some(r) = latest() {
+            http.set_github_endpoint(repo, "latest");
             return Ok(r);
         }
     }
-    let list: Vec<Value> = serde_json::from_value(http.get_json(&format!("{api}?per_page=15"))?)?;
-    pick_release(&list, &spec.asset).ok_or_else(|| no_asset(spec))
+    if let Some(r) = list()? {
+        http.set_github_endpoint(repo, "list");
+        return Ok(r);
+    }
+    if list_first {
+        if let Some(r) = latest() {
+            http.set_github_endpoint(repo, "latest");
+            return Ok(r);
+        }
+    }
+    Err(no_asset(spec))
 }
 
 fn gitea(http: &Http, spec: &SourceSpec) -> Result<Release> {

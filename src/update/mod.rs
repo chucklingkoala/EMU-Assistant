@@ -214,7 +214,7 @@ const CHECK_WORKERS: usize = 6;
 
 /// Looks up the latest release of every item that has a source.
 pub fn check(items: &mut [UpdateItem], opts: &Opts, cancel: &AtomicBool, status: &mut dyn FnMut(String)) -> Result<()> {
-    let http = Http::new(opts.github_token.clone());
+    let http = Http::with_cache(opts.github_token.clone(), http::cache_path());
     let (tx, rx) = crossbeam_channel::unbounded::<String>();
     let queue = std::sync::Mutex::new(items.iter_mut());
     std::thread::scope(|s| {
@@ -238,6 +238,7 @@ pub fn check(items: &mut [UpdateItem], opts: &Opts, cancel: &AtomicBool, status:
             status(m);
         }
     });
+    http.save_cache();
     if cancel.load(Ordering::Relaxed) {
         bail!("cancelled");
     }
@@ -488,6 +489,7 @@ pub fn install(items: &[UpdateItem], opts: &Opts, cancel: &AtomicBool, tx: &Send
             break;
         }
         ctx.progress.done_files = i as u64;
+        let failed_before = report.failed.len();
         match install_one(item, &mut ctx) {
             Ok(n) => {
                 report.copied += n;
@@ -502,7 +504,15 @@ pub fn install(items: &[UpdateItem], opts: &Opts, cancel: &AtomicBool, tx: &Send
                 report.failed.push(format!("{}: {e:#}", item.id()));
             }
         }
-        let _ = fs::remove_dir_all(work_dir(item.id()));
+        // after a failure or cancel, keep the downloads so the next try continues them
+        let work = work_dir(item.id());
+        if report.failed.len() == failed_before && !report.cancelled {
+            let _ = fs::remove_dir_all(&work);
+        } else {
+            for d in ["x", "cores_x"] {
+                let _ = fs::remove_dir_all(work.join(d));
+            }
+        }
     }
     report.copied_bytes = ctx.progress.done_bytes;
     ctx.progress.done_files = items.len() as u64;

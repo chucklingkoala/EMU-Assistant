@@ -690,7 +690,10 @@ impl App {
         let (tx, rx) = unbounded();
         let token = self.cfg.github_token();
         thread::spawn(move || {
-            let _ = tx.send(app_update::check(&update::http::Http::new(token)));
+            let http = update::http::Http::with_cache(token, update::http::cache_path());
+            let res = app_update::check(&http);
+            http.save_cache();
+            let _ = tx.send(res);
         });
         self.app_check_note = Some(("Checking…".into(), false));
         self.app_rx = Some(rx);
