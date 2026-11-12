@@ -35,6 +35,11 @@ pub struct AppRelease {
     pub published: String,
     pub asset_url: String,
     pub size: u64,
+    /// SHA-256 of the exe as GitHub reports it for the asset (lowercase hex).
+    pub sha256: Option<String>,
+    /// The `EMUAssistant.exe.sha256` file published with the release, used when GitHub
+    /// reports no digest.
+    pub checksum_url: Option<String>,
 }
 
 /// An older EMU Assistant installed on this machine.
@@ -61,6 +66,12 @@ fn parse_release(rel: &Value, current: &str) -> Result<Option<AppRelease>> {
     if cmp_numeric(&r.version, current) != Some(Ordering::Greater) {
         return Ok(None);
     }
+    let assets = rel.get("assets").and_then(Value::as_array).cloned().unwrap_or_default();
+    let field = |name: &str, key: &str| {
+        assets.iter().find(|a| a.get("name").and_then(Value::as_str) == Some(name)).and_then(|a| a.get(key)?.as_str().map(String::from))
+    };
+    let sha256 = field(&r.asset_name, "digest").and_then(|d| d.strip_prefix("sha256:").map(str::to_lowercase));
+    let checksum_url = field(&format!("{}.sha256", r.asset_name), "browser_download_url");
     Ok(Some(AppRelease {
         version: r.version,
         notes: s("body"),
@@ -68,6 +79,8 @@ fn parse_release(rel: &Value, current: &str) -> Result<Option<AppRelease>> {
         published: r.published,
         asset_url: r.asset_url,
         size: r.size,
+        sha256,
+        checksum_url,
     }))
 }
 
@@ -77,8 +90,30 @@ fn sibling(p: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// SHA-256 of a file as lowercase hex.
+pub fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut f = fs::File::open(long(path))?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// The first word of a `sha256sum`-style line, if it looks like a SHA-256.
+fn parse_checksum(text: &str) -> Option<String> {
+    let word = text.split_whitespace().next()?.to_lowercase();
+    (word.len() == 64 && word.chars().all(|c| c.is_ascii_hexdigit())).then_some(word)
+}
+
 /// Sanity checks a downloaded or copied exe before it replaces the real one.
-fn check_exe(path: &Path, size: u64, version: Option<&str>) -> Result<()> {
+fn check_exe(path: &Path, size: u64, version: Option<&str>, sha256: Option<&str>) -> Result<()> {
     let meta = fs::metadata(long(path))?;
     ensure!(size == 0 || meta.len() == size, "the download is incomplete ({} of {size} bytes)", meta.len());
     let mut head = [0u8; 2];
@@ -86,6 +121,10 @@ fn check_exe(path: &Path, size: u64, version: Option<&str>) -> Result<()> {
     ensure!(&head == b"MZ", "the download is not a Windows program");
     if let (Some(want), Some(got)) = (version, pe_version(path)) {
         ensure!(cmp_numeric(&got, want) == Some(Ordering::Equal), "the download is version {got}, expected {want}");
+    }
+    if let Some(want) = sha256 {
+        let got = sha256_file(path)?;
+        ensure!(got.eq_ignore_ascii_case(want), "the download's checksum doesn't match the release (SHA-256 {got}, expected {want})");
     }
     Ok(())
 }
@@ -141,7 +180,18 @@ fn install_running(http: &Http, rel: &AppRelease, cancel: &AtomicBool, tx: &Send
     if !done {
         return Ok(false);
     }
-    let placed = check_exe(&new, rel.size, Some(&rel.version)).and_then(|()| swap(&exe, &new));
+    let sha256 = match (&rel.sha256, &rel.checksum_url) {
+        (Some(s), _) => Some(s.clone()),
+        (None, Some(url)) => {
+            let text = http.get_text(url).with_context(|| format!("reading the checksum {url}"))?;
+            Some(parse_checksum(&text).with_context(|| format!("{url} holds no SHA-256"))?)
+        }
+        (None, None) => {
+            let _ = tx.send(Event::Log("This release has no checksum; checked its size and version only.".into()));
+            None
+        }
+    };
+    let placed = check_exe(&new, rel.size, Some(&rel.version), sha256.as_deref()).and_then(|()| swap(&exe, &new));
     if let Err(e) = placed {
         let _ = fs::remove_file(long(&new));
         bail!("{e:#}. You can download it yourself from {}", rel.page);
@@ -195,7 +245,8 @@ pub fn replace(target: &Path, source: &Path) -> Result<()> {
     let meta = fs::metadata(long(source))?;
     sync::copy_file(source, &new, FileTime::from_last_modification_time(&meta), false, &AtomicBool::new(false), &mut |_| {})
         .with_context(|| format!("copying to {}", new.display()))?;
-    let placed = check_exe(&new, meta.len(), None).and_then(|()| swap(target, &new));
+    // the copy must be the drive's exe byte for byte
+    let placed = sha256_file(source).and_then(|want| check_exe(&new, meta.len(), None, Some(&want))).and_then(|()| swap(target, &new));
     if placed.is_err() {
         let _ = fs::remove_file(long(&new));
     }
@@ -252,10 +303,46 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("x.exe");
         fs::write(&f, "<html>").unwrap();
-        assert!(check_exe(&f, 0, None).is_err());
+        assert!(check_exe(&f, 0, None, None).is_err());
         fs::write(&f, "MZ....").unwrap();
-        assert!(check_exe(&f, 6, None).is_ok());
-        assert!(check_exe(&f, 7, None).is_err());
+        assert!(check_exe(&f, 6, None, None).is_ok());
+        assert!(check_exe(&f, 7, None, None).is_err());
+        let sum = sha256_file(&f).unwrap();
+        assert_eq!(sum.len(), 64);
+        assert!(check_exe(&f, 6, None, Some(&sum)).is_ok());
+        assert!(check_exe(&f, 6, None, Some(&sum.to_uppercase())).is_ok());
+        let mut wrong = sum.clone();
+        let last = wrong.pop().unwrap();
+        wrong.push(if last == '0' { '1' } else { '0' });
+        let err = check_exe(&f, 6, None, Some(&wrong)).unwrap_err().to_string();
+        assert!(err.contains("checksum"), "{err}");
+        // SHA-256 of "abc"
+        fs::write(&f, "abc").unwrap();
+        assert_eq!(sha256_file(&f).unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    #[test]
+    fn reads_the_published_checksum() {
+        let sum = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert_eq!(parse_checksum(&format!("{sum}  EMUAssistant.exe
+")).as_deref(), Some(sum));
+        assert_eq!(parse_checksum(&sum.to_uppercase()).as_deref(), Some(sum));
+        assert!(parse_checksum("<html>not found</html>").is_none());
+        assert!(parse_checksum("").is_none());
+
+        // GitHub's digest wins; the .sha256 asset is remembered as the fallback
+        let mut rel = release("v0.9.0", "EMUAssistant.exe");
+        rel["assets"][0]["digest"] = json!(format!("sha256:{}", sum.to_uppercase()));
+        rel["assets"].as_array_mut().unwrap().push(json!({
+            "name": "EMUAssistant.exe.sha256",
+            "browser_download_url": "https://example.org/EMUAssistant.exe.sha256",
+            "size": 84
+        }));
+        let r = parse_release(&rel, "0.5.0").unwrap().unwrap();
+        assert_eq!(r.sha256.as_deref(), Some(sum));
+        assert_eq!(r.checksum_url.as_deref(), Some("https://example.org/EMUAssistant.exe.sha256"));
+        let r = parse_release(&release("v0.9.0", "EMUAssistant.exe"), "0.5.0").unwrap().unwrap();
+        assert_eq!((r.sha256, r.checksum_url), (None, None));
     }
 
     /// `cargo test live_self_update -- --ignored`: fetches the latest real release and swaps it
@@ -271,7 +358,9 @@ mod tests {
         fs::write(&exe, "MZ stand-in").unwrap();
         let new = sibling(&exe, ".new");
         assert!(http.download(&rel.asset_url, &new, &AtomicBool::new(false), &mut |_| {}).unwrap());
-        check_exe(&new, rel.size, Some(&rel.version)).unwrap();
+        let sum = rel.sha256.clone().or_else(|| rel.checksum_url.as_ref().and_then(|u| parse_checksum(&http.get_text(u).ok()?)));
+        println!("checksum: {sum:?}");
+        check_exe(&new, rel.size, Some(&rel.version), sum.as_deref()).unwrap();
         swap(&exe, &new).unwrap();
         let got = pe_version(&exe).map(|v| short_version(&v));
         assert_eq!(got.as_deref(), Some(rel.version.as_str()));

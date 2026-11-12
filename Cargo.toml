@@ -26,6 +26,7 @@ dirs = "5"
 ureq = { version = "=3.4.2", features = ["json"] }
 zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
 sevenz-rust2 = { version = "=0.23.0", default-features = false, features = ["util"] }
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

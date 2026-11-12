@@ -13,6 +13,9 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # Secrets can't be used in `if:`; this flag can. Signing runs only when a certificate is set.
+      HAS_CERT: ${{ secrets.SIGNING_CERT_PFX != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -42,6 +45,24 @@ jobs:
       - name: Build release
         run: cargo build --release --locked
 
+      # Authenticode signature, so SmartScreen knows the publisher. Needs the repository
+      # secrets SIGNING_CERT_PFX (the .pfx file, base64) and SIGNING_CERT_PASSWORD.
+      - name: Sign
+        if: env.HAS_CERT == 'true'
+        shell: pwsh
+        env:
+          CERT_PFX: ${{ secrets.SIGNING_CERT_PFX }}
+          CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "cert.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_PFX))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          & $signtool.FullName sign /f $pfx /p $env:CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 target/release/EMUAssistant.exe
+          $code = $LASTEXITCODE
+          Remove-Item $pfx
+          if ($code -ne 0) { exit $code }
+
+      # after signing, so the checksum matches the published exe
       - name: Checksum
         shell: pwsh
         run: |
