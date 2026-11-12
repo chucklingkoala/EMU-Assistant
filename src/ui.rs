@@ -1075,7 +1075,7 @@ impl App {
                         self.app_window = true;
                     }
                 }
-                ui.label(RichText::new(format!("v{}", app_update::VERSION)).small().weak());
+                ui.label(RichText::new(format!("v{}", app_update::VERSION)).weak());
                 if cog.clicked() {
                     self.settings_open = !self.settings_open;
                     if self.settings_open {
