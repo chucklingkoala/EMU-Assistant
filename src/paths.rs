@@ -82,6 +82,28 @@ pub fn remap(path: &Path, remaps: &[(PathBuf, PathBuf)]) -> PathBuf {
     path.to_path_buf()
 }
 
+/// The path from the folder `from_dir` to `to`, using `..` where needed:
+/// `E:\Emu\ES-DE` to `E:\Games\ROMs` gives `..\..\Games\ROMs`. `None` when the two
+/// share no root (other volumes). Both should be absolute and normalized.
+pub fn relative(from_dir: &Path, to: &Path) -> Option<PathBuf> {
+    let a: Vec<Component> = from_dir.components().collect();
+    let b: Vec<Component> = to.components().collect();
+    let common = a.iter().zip(&b).take_while(|(x, y)| comp_key(x) == comp_key(y)).count();
+    // the volume (and its root) must be shared
+    let root_len = a.iter().take_while(|c| matches!(c, Component::Prefix(_) | Component::RootDir)).count();
+    if common < root_len.max(1) {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for _ in common..a.len() {
+        out.push("..");
+    }
+    for c in &b[common..] {
+        out.push(c.as_os_str());
+    }
+    Some(out)
+}
+
 /// Adds the `\\?\` prefix so file APIs accept paths longer than 260 characters.
 pub fn long(p: &Path) -> PathBuf {
     let s = p.to_string_lossy();
@@ -147,6 +169,16 @@ mod tests {
         assert_eq!(remap(Path::new(r"D:\ES-DE\ROMs\snes"), &r), PathBuf::from(r"F:\ROMs\snes"));
         assert_eq!(remap(Path::new(r"D:\ES-DE\ES-DE.exe"), &r), PathBuf::from(r"C:\ES-DE\ES-DE.exe"));
         assert_eq!(remap(Path::new(r"X:\Other"), &r), PathBuf::from(r"X:\Other"));
+    }
+
+    #[test]
+    fn relative_paths() {
+        let es = Path::new(r"E:\Emu\ES-DE");
+        assert_eq!(relative(es, Path::new(r"E:\Games\ROMs")), Some(PathBuf::from(r"..\..\Games\ROMs")));
+        assert_eq!(relative(es, Path::new(r"e:\emu\es-de\ROMs")), Some(PathBuf::from("ROMs")));
+        assert_eq!(relative(es, es), Some(PathBuf::new()));
+        assert_eq!(relative(es, Path::new(r"D:\Games")), None);
+        assert_eq!(relative(Path::new(r"E:\"), Path::new(r"E:\x\y")), Some(PathBuf::from(r"x\y")));
     }
 
     #[test]

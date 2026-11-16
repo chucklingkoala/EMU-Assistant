@@ -13,6 +13,7 @@ mod gauge_geom;
 mod manifest;
 mod paths;
 mod plan;
+mod play;
 mod power;
 mod scan;
 mod select;
@@ -56,6 +57,10 @@ fn main() -> anyhow::Result<()> {
     if args.get(1).map(String::as_str) == Some("--export") {
         attach_console();
         std::process::exit(headless_export(&args[2..]));
+    }
+    if args.get(1).map(String::as_str) == Some("--play") {
+        attach_console();
+        std::process::exit(start_play(&args[2..]));
     }
 
     let mut viewport = egui::ViewportBuilder::default()
@@ -107,6 +112,51 @@ fn headless_export(args: &[String]) -> i32 {
         Ok(_) => 1,
         Err(e) => {
             out(format!("Not started: {}", e.0));
+            2
+        }
+    }
+}
+
+const PLAY_USAGE: &str = "usage: EMUAssistant --play [drive folder]   (default: the folder this exe is in)";
+
+/// `--play`: starts ES-DE from a direct-play drive. Exit code 0 when started, 2 when not.
+fn start_play(args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{PLAY_USAGE}");
+        return 0;
+    }
+    let folder = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok().and_then(|e| e.parent().map(PathBuf::from)));
+    let Some(folder) = folder.map(|f| paths::normalize(&f)) else {
+        eprintln!("{PLAY_USAGE}");
+        return 2;
+    };
+    let mut m = match manifest::load(&folder) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            eprintln!("No EMU Assistant package in {}", folder.display());
+            return 2;
+        }
+        Err(e) => {
+            eprintln!("Could not read the package: {e:#}");
+            return 2;
+        }
+    };
+    if m.play.is_none() {
+        eprintln!("Direct play is off for this drive. Turn it on in EMU Assistant: Deploy tab, Direct play.");
+        return 2;
+    }
+    match play::launch(&folder, &mut m) {
+        Ok(lines) => {
+            lines.iter().for_each(|l| println!("{l}"));
+            println!("ES-DE started from {}", folder.display());
+            0
+        }
+        Err(e) => {
+            eprintln!("Could not start ES-DE: {e:#}");
             2
         }
     }

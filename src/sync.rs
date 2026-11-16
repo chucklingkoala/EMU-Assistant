@@ -376,7 +376,7 @@ mod tests {
         build(&[g], &Mapper::Export { dest_root: dest.to_path_buf() }, &opts, &AtomicBool::new(false), &mut |_| {}).unwrap()
     }
 
-    const OPTS: PlanOptions = PlanOptions { protect_newer: true, prune: false };
+    const OPTS: PlanOptions = PlanOptions { protect_newer: true, prune: false, add_only: false };
 
     #[test]
     fn copies_then_skips_then_resumes() {
@@ -426,7 +426,7 @@ mod tests {
         filetime::set_file_mtime(&save_dst, future).unwrap();
         fs::remove_file(src.join("gone.bin")).unwrap();
 
-        let p = plan_for(&src, &dest, PlanOptions { protect_newer: true, prune: true });
+        let p = plan_for(&src, &dest, PlanOptions { protect_newer: true, prune: true, add_only: false });
         assert_eq!(p.copy.len(), 0);
         assert_eq!(p.protected.len(), 1);
         assert_eq!(p.prune.len(), 1);
@@ -434,7 +434,7 @@ mod tests {
         assert_eq!(r.pruned, 1);
         assert_eq!(fs::read(&save_dst).unwrap(), b"newer progress");
 
-        let p = plan_for(&src, &dest, PlanOptions { protect_newer: false, prune: false });
+        let p = plan_for(&src, &dest, PlanOptions { protect_newer: false, prune: false, add_only: false });
         assert_eq!(p.copy.len(), 1);
     }
 
@@ -480,7 +480,7 @@ mod tests {
         assert!(gone_dst.join(r"sub\b.bin").is_file());
 
         fs::remove_dir_all(src.join("gone")).unwrap();
-        let p = plan_for(&src, &dest, PlanOptions { protect_newer: true, prune: true });
+        let p = plan_for(&src, &dest, PlanOptions { protect_newer: true, prune: true, add_only: false });
         assert_eq!(p.prune.len(), 1);
         let r = execute(&p, false, &no, &tx);
         assert_eq!((r.pruned, r.failed.len()), (1, 0));

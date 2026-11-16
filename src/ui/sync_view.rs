@@ -100,6 +100,15 @@ impl App {
             });
             ui.end_row();
         });
+        if self.export_merge_for != self.dest {
+            self.refresh_export_merge();
+        }
+        if let Some((_, owner)) = &self.export_merge {
+            ui.colored_label(
+                ACCENT,
+                format!("This is a direct-play drive set up by {owner}: only this machine's ROMs and scraped media are added. Files already on the drive are kept."),
+            );
+        }
         if let Some(a) = action {
             self.profile_action(a);
         }
@@ -260,9 +269,14 @@ impl App {
                 ui.heading("Options");
                 ui.checkbox(&mut self.sel.gamelists, "Gamelists of selected systems");
                 ui.checkbox(&mut self.sel.media, "Scraped media of selected systems");
-                ui.checkbox(&mut self.prune, "Delete files missing from source").on_hover_text(
-                    "Mirror mode for ROMs and scraped media of the selected systems: destination files that no longer exist in the source are deleted. Emulators and ES-DE files are never deleted. You will be asked to confirm.",
-                );
+                let merging = self.mode == Mode::Export && self.export_merge.is_some();
+                if merging {
+                    ui.label(RichText::new("Adding to a direct-play drive: gamelists, emulators and ES-DE files are not sent, nothing is deleted.").small().weak());
+                } else {
+                    ui.checkbox(&mut self.prune, "Delete files missing from source").on_hover_text(
+                        "Mirror mode for ROMs and scraped media of the selected systems: destination files that no longer exist in the source are deleted. Emulators and ES-DE files are never deleted. You will be asked to confirm.",
+                    );
+                }
                 let mut active = Vec::new();
                 if self.cfg.protect_newer() {
                     active.push("newer files at the destination are kept");
@@ -486,6 +500,18 @@ impl App {
                     self.start_copy();
                 }
             }
+            if self.mode == Mode::Deploy && self.manifest.is_some() {
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Direct play…"))
+                    .on_hover_text("Run ES-DE and the emulators straight from this drive")
+                    .clicked()
+                {
+                    self.open_play();
+                }
+                if self.manifest.as_ref().is_some_and(|m| m.play.is_some()) {
+                    ui.label(RichText::new("Direct play is on").color(GOOD));
+                }
+            }
             if busy && ui.button("Cancel").clicked() {
                 if let Some(j) = &self.job {
                     j.cancel();
@@ -524,6 +550,17 @@ impl App {
                     ui.label(RichText::new("Saves made on this machine can be copied back with the Bring back tab.").small().weak());
                 }
             }
+            if !p.kept.is_empty() {
+                egui::CollapsingHeader::new(format!("Already on the drive with different content (kept): {}", p.kept.len()))
+                    .id_salt("kept")
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical().max_height(120.0).id_salt("kept_scroll").show(ui, |ui| {
+                            for f in p.kept.iter().take(500) {
+                                ui.label(RichText::new(f.display().to_string()).small());
+                            }
+                        });
+                    });
+            }
         }
 
         if let (false, Some(r)) = (busy, &self.report) {
@@ -548,6 +585,15 @@ impl App {
                     "{} files at the destination no longer exist in the source and will be deleted:",
                     plan.prune.len()
                 ));
+                if self.mode == Mode::Export && !self.export_contributors.is_empty() {
+                    ui.colored_label(
+                        WARN,
+                        format!(
+                            "{} added ROMs to this drive. They are not on this PC, so they are in this list too.",
+                            self.export_contributors.join(", ")
+                        ),
+                    );
+                }
                 egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
                     for f in plan.prune.iter().take(1000) {
                         ui.label(RichText::new(f.display().to_string()).small());

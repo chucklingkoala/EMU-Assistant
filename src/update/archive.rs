@@ -118,12 +118,13 @@ fn seven_zip_exe() -> Option<PathBuf> {
 }
 
 /// The folder inside an unpacked archive that holds `exe_name` (the shallowest match),
-/// so archives with or without a top-level folder both work.
+/// so archives with or without a top-level folder both work. `exe_name` may hold `*`.
 pub fn find_root(staging: &Path, exe_name: &str) -> Option<PathBuf> {
     let mut errors = Vec::new();
     let mut best: Option<(usize, PathBuf)> = None;
+    let matches = |n: &str| if exe_name.contains('*') { crate::esde::find_rules::wildcard(exe_name, n) } else { n.eq_ignore_ascii_case(exe_name) };
     walk(staging, &[], true, &mut errors, |p, m| {
-        if m.is_file() && p.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(exe_name)) {
+        if m.is_file() && p.file_name().is_some_and(|n| matches(&n.to_string_lossy())) {
             let depth = p.components().count();
             if best.as_ref().is_none_or(|(d, _)| depth < *d) {
                 best = p.parent().map(|d| (depth, d.to_path_buf()));

@@ -10,7 +10,7 @@ use filetime::FileTime;
 use serde::{Deserialize, Serialize};
 
 use crate::fsutil::walk;
-use crate::paths::{is_under, key, long, mirror, remap, volume_root};
+use crate::paths::{eq_ci, is_under, key, long, mirror, remap, volume_root};
 use crate::scan::{Catalog, Roots};
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -109,13 +109,43 @@ pub fn groups_for(cat: &Catalog, sel: &Selection) -> Vec<Group> {
     out
 }
 
+/// Files on the drive that Deploy reads differently: the changes direct play made there
+/// stay on the drive.
+#[derive(Clone, Debug, Default)]
+pub struct Overlay {
+    /// Files not deployed (keys from [`key`]).
+    pub skip: HashSet<String>,
+    /// Folders not deployed, with everything in them.
+    pub skip_dirs: Vec<PathBuf>,
+    /// File key -> the original to deploy instead.
+    pub swap: HashMap<String, PathBuf>,
+}
+
+impl Overlay {
+    pub fn is_empty(&self) -> bool {
+        self.skip.is_empty() && self.skip_dirs.is_empty() && self.swap.is_empty()
+    }
+
+    /// True for a drive file that is direct play's own (created by it, or below such a folder).
+    pub fn hides(&self, p: &Path) -> bool {
+        self.skip.contains(&key(p)) || self.skip_dirs.iter().any(|d| is_under(p, d))
+    }
+}
+
 /// Where a group's files are read from and written to.
 #[derive(Clone, Debug)]
 pub enum Mapper {
     /// Source machine -> drive: same paths, drive letter swapped for `dest_root`.
     Export { dest_root: PathBuf },
     /// Drive -> target machine: read from the mirror under `pkg_root`, write to remapped roots.
-    Deploy { pkg_root: PathBuf, remaps: Vec<(PathBuf, PathBuf)> },
+    Deploy { pkg_root: PathBuf, remaps: Vec<(PathBuf, PathBuf)>, overlay: Overlay },
+    /// This machine's ROMs and media -> the folders of a direct-play drive set up by another
+    /// machine.
+    Merge { remaps: Vec<(PathBuf, PathBuf)> },
+}
+
+fn most_specific_first(remaps: &mut [(PathBuf, PathBuf)]) {
+    remaps.sort_by_key(|(from, _)| std::cmp::Reverse(from.components().count()));
 }
 
 impl Mapper {
@@ -125,13 +155,31 @@ impl Mapper {
             (orig.media_dir.clone(), target.media_dir.clone()),
             (orig.es_root.clone(), target.es_root.clone()),
         ];
-        remaps.sort_by_key(|(from, _)| std::cmp::Reverse(from.components().count()));
-        Mapper::Deploy { pkg_root: pkg_root.to_path_buf(), remaps }
+        most_specific_first(&mut remaps);
+        Mapper::Deploy { pkg_root: pkg_root.to_path_buf(), remaps, overlay: Overlay::default() }
+    }
+
+    /// Deploy that leaves direct play's changes on the drive.
+    pub fn with_overlay(self, o: Overlay) -> Self {
+        match self {
+            Mapper::Deploy { pkg_root, remaps, .. } => Mapper::Deploy { pkg_root, remaps, overlay: o },
+            other => other,
+        }
+    }
+
+    /// `this`: the roots scanned on this machine; `owner`: the roots recorded on the drive.
+    pub fn merge(dest_root: &Path, this: &Roots, owner: &Roots) -> Self {
+        let mut remaps = vec![
+            (this.rom_dir.clone(), mirror(dest_root, &owner.rom_dir)),
+            (this.media_dir.clone(), mirror(dest_root, &owner.media_dir)),
+        ];
+        most_specific_first(&mut remaps);
+        Mapper::Merge { remaps }
     }
 
     pub fn src(&self, orig: &Path) -> PathBuf {
         match self {
-            Mapper::Export { .. } => orig.to_path_buf(),
+            Mapper::Export { .. } | Mapper::Merge { .. } => orig.to_path_buf(),
             Mapper::Deploy { pkg_root, .. } => mirror(pkg_root, orig),
         }
     }
@@ -139,7 +187,14 @@ impl Mapper {
     pub fn dst(&self, orig: &Path) -> PathBuf {
         match self {
             Mapper::Export { dest_root } => mirror(dest_root, orig),
-            Mapper::Deploy { remaps, .. } => remap(orig, remaps),
+            Mapper::Deploy { remaps, .. } | Mapper::Merge { remaps } => remap(orig, remaps),
+        }
+    }
+
+    pub fn overlay(&self) -> Option<&Overlay> {
+        match self {
+            Mapper::Deploy { overlay, .. } if !overlay.is_empty() => Some(overlay),
+            _ => None,
         }
     }
 }
@@ -148,6 +203,26 @@ impl Mapper {
 pub struct PlanOptions {
     pub protect_newer: bool,
     pub prune: bool,
+    /// Only add files: a different file of the same name at the destination is kept
+    /// (and listed in [`Plan::kept`]).
+    pub add_only: bool,
+}
+
+/// Groups for adding this machine's ROMs (and media) to a direct-play drive another
+/// machine set up: no emulators, ES-DE parts or gamelists. Systems whose ROM folder lies
+/// outside this machine's ROM folder can't be placed and are left out with a warning.
+pub fn merge_groups(cat: &Catalog, sel: &Selection) -> (Vec<Group>, Vec<String>) {
+    let mut sel = sel.clone();
+    sel.gamelists = false;
+    sel.emulators.clear();
+    sel.globals.clear();
+    let inside = |s: &crate::scan::SysEntry| is_under(&s.rom_dir, &cat.roots.rom_dir) && !eq_ci(&s.rom_dir, &cat.roots.rom_dir);
+    let mut warnings = Vec::new();
+    for s in cat.systems.iter().filter(|s| sel.systems.contains(&s.name) && !inside(s)) {
+        warnings.push(format!("{}: its ROM folder {} is outside the ROM folder, left out", s.fullname, s.rom_dir.display()));
+    }
+    sel.systems.retain(|n| cat.systems.iter().find(|s| &s.name == n).is_some_and(inside));
+    (groups_for(cat, &sel), warnings)
 }
 
 #[derive(Clone, Debug)]
@@ -166,6 +241,8 @@ pub struct Plan {
     pub skipped_bytes: u64,
     /// Destination files newer than the source, left alone.
     pub protected: Vec<PathBuf>,
+    /// With `add_only`: destination files that differ from the source, left alone.
+    pub kept: Vec<PathBuf>,
     pub prune: Vec<PathBuf>,
     /// Destination folders of the groups that have files in `prune`; emptied folders
     /// below them are removed after the files.
@@ -215,7 +292,11 @@ pub fn build(
             plan.warnings.push(format!("{}: {} not found, skipped", g.label, src_root.display()));
             continue;
         }
-        let src_ex: Vec<PathBuf> = g.excludes.iter().map(|e| m.src(e)).collect();
+        let overlay = m.overlay();
+        let mut src_ex: Vec<PathBuf> = g.excludes.iter().map(|e| m.src(e)).collect();
+        if let Some(o) = overlay {
+            src_ex.extend(o.skip_dirs.iter().filter(|d| is_under(d, &src_root)).cloned());
+        }
         let mut group_dsts = HashSet::new();
         let mut items = Vec::new();
         let mut errors = Vec::new();
@@ -228,6 +309,25 @@ pub fn build(
                     plan.dirs.push(dst);
                 }
             } else if meta.is_file() && !skipped_stem(g, p) {
+                if let Some(o) = overlay {
+                    let k = key(p);
+                    if o.skip.contains(&k) {
+                        return;
+                    }
+                    if let Some(orig) = o.swap.get(&k) {
+                        match std::fs::metadata(long(orig)) {
+                            Ok(om) if om.is_file() => {
+                                items.push((orig.clone(), dst, om.len(), FileTime::from_last_modification_time(&om)));
+                                return;
+                            }
+                            _ => plan.warnings.push(format!(
+                                "{}: the original of {} is missing, deploying the direct-play version",
+                                g.label,
+                                p.display()
+                            )),
+                        }
+                    }
+                }
                 items.push((p.to_path_buf(), dst, meta.len(), FileTime::from_last_modification_time(meta)));
             }
         });
@@ -278,6 +378,10 @@ pub fn build(
                 if len == size && diff.abs() <= MTIME_TOLERANCE_NS {
                     plan.skipped += 1;
                     plan.skipped_bytes += size;
+                    continue;
+                }
+                if opts.add_only {
+                    plan.kept.push(dst);
                     continue;
                 }
                 if opts.protect_newer && diff > MTIME_TOLERANCE_NS {
@@ -343,7 +447,7 @@ mod tests {
         let cat = scan(&es, &AtomicBool::new(false), &mut |_| {}).unwrap();
         let dest = tmp.path().join("drive");
         let m = Mapper::Export { dest_root: dest.clone() };
-        let plan = build(&groups_for(&cat, &all(&cat)), &m, &PlanOptions { protect_newer: true, prune: false }, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        let plan = build(&groups_for(&cat, &all(&cat)), &m, &PlanOptions { protect_newer: true, prune: false, add_only: false }, &AtomicBool::new(false), &mut |_| {}).unwrap();
 
         let rom = plan.copy.iter().find(|i| i.src.ends_with(r"snes\a.sfc")).unwrap();
         assert!(eq_ci(&rom.dst, &mirror(&dest, &rom.src)));
@@ -364,7 +468,7 @@ mod tests {
         let cat = scan(&es, &AtomicBool::new(false), &mut |_| {}).unwrap();
         let dest = tmp.path().join("drive");
         let m = Mapper::Export { dest_root: dest };
-        let opts = PlanOptions { protect_newer: true, prune: false };
+        let opts = PlanOptions { protect_newer: true, prune: false, add_only: false };
         let run = |sel: &Selection| build(&groups_for(&cat, sel), &m, &opts, &AtomicBool::new(false), &mut |_| {}).unwrap();
         let has = |p: &Plan, s: &str| p.copy.iter().any(|i| i.src.to_string_lossy().contains(s));
 
@@ -422,7 +526,7 @@ mod tests {
         let cat = scan(&es, &AtomicBool::new(false), &mut |_| {}).unwrap();
         let mut sel = all(&cat);
         sel.systems.remove("psx");
-        let opts = PlanOptions { protect_newer: true, prune: false };
+        let opts = PlanOptions { protect_newer: true, prune: false, add_only: false };
         let (tx, _rx) = crossbeam_channel::unbounded();
         let no = AtomicBool::new(false);
 
@@ -517,7 +621,7 @@ mod tests {
         }
         let sel = pick("A [0100000000010000][v0].nsp");
         let m = Mapper::Export { dest_root: drive.clone() };
-        let p = build(&groups_for(&cat, &sel), &m, &PlanOptions { protect_newer: true, prune: true }, &no, &mut |_| {}).unwrap();
+        let p = build(&groups_for(&cat, &sel), &m, &PlanOptions { protect_newer: true, prune: true, add_only: false }, &no, &mut |_| {}).unwrap();
         assert_eq!(names(&p), vec!["A [0100000000010000][v0].nsp", "A [0100000000010000][v0].png", "A [0100000000010800][v1].nsp", "prod.keys"]);
         // the unpicked game stays on the drive, even in mirror mode
         assert_eq!(p.prune.len(), 1, "{:?}", p.prune);
@@ -533,7 +637,7 @@ mod tests {
         let ally = tmp.path().join("ally");
         let target = Roots { es_root: ally.join("ES-DE"), rom_dir: ally.join("ROMs"), media_dir: ally.join("media") };
         let m = Mapper::deploy(&drive, &roots, &target);
-        let p = build(&groups_for(&pkg, &pick("B.nsp")), &m, &PlanOptions { protect_newer: true, prune: false }, &no, &mut |_| {}).unwrap();
+        let p = build(&groups_for(&pkg, &pick("B.nsp")), &m, &PlanOptions { protect_newer: true, prune: false, add_only: false }, &no, &mut |_| {}).unwrap();
         assert_eq!(names(&p), vec!["B.nsp", "B.png", "prod.keys"]);
         assert!(p.copy.iter().all(|i| is_under(&i.dst, &ally)));
     }
@@ -546,7 +650,7 @@ mod tests {
         let g = Group { label: "x".into(), src: src.clone(), recursive: true, ..Default::default() };
         // exporting to the source's own drive root maps every path onto itself
         let m = Mapper::Export { dest_root: PathBuf::from(volume_root(&src).unwrap()) };
-        assert!(build(&[g], &m, &PlanOptions { protect_newer: true, prune: false }, &AtomicBool::new(false), &mut |_| {}).is_err());
+        assert!(build(&[g], &m, &PlanOptions { protect_newer: true, prune: false, add_only: false }, &AtomicBool::new(false), &mut |_| {}).is_err());
     }
 
     #[test]
@@ -559,7 +663,7 @@ mod tests {
         let m = Mapper::Export { dest_root: dest };
         let group = |label: &str| Group { label: label.into(), src: src.clone(), recursive: true, prunable: true, ..Default::default() };
         let groups = [group("one"), group("two")];
-        let opts = PlanOptions { protect_newer: true, prune: true };
+        let opts = PlanOptions { protect_newer: true, prune: true, add_only: false };
         let no = AtomicBool::new(false);
 
         let p = build(&groups, &m, &opts, &no, &mut |_| {}).unwrap();

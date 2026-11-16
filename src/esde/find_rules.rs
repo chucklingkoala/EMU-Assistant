@@ -66,15 +66,38 @@ pub fn parse(xml: &str) -> Result<Rules> {
     Ok(out)
 }
 
+pub const BUNDLED_REL: &str = r"resources\systems\windows\es_find_rules.xml";
+pub const CUSTOM_REL: &str = r"ES-DE\custom_systems\es_find_rules.xml";
+
+/// Only the rules that ship with ES-DE.
+pub fn bundled(es_root: &Path) -> Result<Rules> {
+    let bundled = es_root.join(BUNDLED_REL);
+    Ok(if bundled.is_file() { parse(&read_text(&bundled)?)? } else { Rules::new() })
+}
+
 /// Bundled Windows rules, with `custom_systems\es_find_rules.xml` entries replacing them by name.
 pub fn load(es_root: &Path) -> Result<Rules> {
-    let bundled = es_root.join(r"resources\systems\windows\es_find_rules.xml");
-    let mut rules = if bundled.is_file() { parse(&read_text(&bundled)?)? } else { Rules::new() };
-    let custom = es_root.join(r"ES-DE\custom_systems\es_find_rules.xml");
+    let mut rules = bundled(es_root)?;
+    let custom = es_root.join(CUSTOM_REL);
     if custom.is_file() {
         rules.extend(parse(&read_text(&custom)?)?);
     }
     Ok(rules)
+}
+
+/// One `<emulator>` element of a find rules file, indented for the ruleList.
+pub fn to_xml(id: &str, rules: &[Rule]) -> String {
+    use quick_xml::escape::escape;
+    let mut s = format!("    <emulator name=\"{}\">\n", escape(id));
+    for r in rules {
+        s.push_str(&format!("        <rule type=\"{}\">\n", escape(r.kind.as_str())));
+        for e in &r.entries {
+            s.push_str(&format!("            <entry>{}</entry>\n", escape(e.as_str())));
+        }
+        s.push_str("        </rule>\n");
+    }
+    s.push_str("    </emulator>\n");
+    s
 }
 
 #[derive(Clone, Debug)]
@@ -86,7 +109,21 @@ pub struct Found {
 
 /// Resolves an emulator id the way ES-DE does: rules in file order, first existing match wins.
 pub fn resolve(id: &str, rules: &Rules, es_root: &Path) -> Option<Found> {
+    resolve_kinds(id, rules, es_root, false)
+}
+
+/// Like [`resolve`], but only with `staticpath` rules: where ES-DE would find the
+/// emulator from its own folder, ignoring what is installed on this machine
+/// (registry, `PATH`).
+pub fn resolve_static(id: &str, rules: &Rules, es_root: &Path) -> Option<Found> {
+    resolve_kinds(id, rules, es_root, true)
+}
+
+fn resolve_kinds(id: &str, rules: &Rules, es_root: &Path, static_only: bool) -> Option<Found> {
     for rule in rules.get(id)? {
+        if static_only && rule.kind != "staticpath" {
+            continue;
+        }
         for entry in &rule.entries {
             let hit = match rule.kind.as_str() {
                 "staticpath" => find_static(&expand(entry, es_root)),
@@ -273,6 +310,23 @@ mod tests {
         assert!(crate::paths::eq_ci(&f.dir, &dir));
         assert_eq!(f.via, "staticpath");
         assert!(resolve("NOPE", &rules, tmp.path()).is_none());
+    }
+
+    #[test]
+    fn static_only_and_xml_roundtrip() {
+        let rules = parse(SAMPLE).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("RetroArch-Win64");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("retroarch.exe"), b"x").unwrap();
+        assert_eq!(resolve_static("RETROARCH", &rules, tmp.path()).unwrap().via, "staticpath");
+
+        let xml = format!("<ruleList>\n{}</ruleList>", to_xml("A&B", &rules["RETROARCH"]));
+        let back = parse(&xml).unwrap();
+        let r = &back["A&B"];
+        assert_eq!(r.len(), 2);
+        assert_eq!((r[0].kind.as_str(), r[0].entries.clone()), ("winregistrypath", vec!["retroarch_does_not_exist.exe".to_string()]));
+        assert_eq!(r[1].entries.len(), 2);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! `<drive>\EMUAssistant\manifest.json`: what was exported, from where. Deploy mode reads it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,6 +18,40 @@ pub const EXE_NAME: &str = "EMUAssistant.exe";
 /// Name of the exe copied to the drive by earlier versions.
 pub const LEGACY_EXE_NAME: &str = "EMU Assistant.exe";
 const FORMAT: u32 = 1;
+/// Below [`DIR`]: the originals of files that direct play changed.
+pub const PLAY_ORIG: &str = "play-orig";
+
+/// Direct play is on: ES-DE runs from the drive. Every file it created or changed is
+/// listed, so Deploy can ignore the changes and Turn off can undo them.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct PlayState {
+    pub enabled_unix: u64,
+    /// Emulator ids switched to portable mode (re-applied after exports).
+    #[serde(default)]
+    pub make_portable: BTreeSet<String>,
+    /// Files and folders direct play created or changed; key: lowercase path relative to
+    /// the package folder.
+    #[serde(default)]
+    pub touched: BTreeMap<String, Touched>,
+    /// Programs downloaded for direct play: id -> folder relative to the package folder.
+    #[serde(default)]
+    pub added: BTreeMap<String, PathBuf>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Touched {
+    /// Relative to the package folder.
+    pub rel: PathBuf,
+    /// Direct play created it (Turn off deletes it). Otherwise it existed and the original
+    /// is kept in [`PLAY_ORIG`].
+    pub created: bool,
+    #[serde(default)]
+    pub is_dir: bool,
+    /// SHA-256 of the content direct play last wrote: when the file no longer has it,
+    /// something else (an export) replaced it, and that version is the new original.
+    #[serde(default)]
+    pub written: String,
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Manifest {
@@ -31,6 +65,12 @@ pub struct Manifest {
     /// Selections exported under a profile name, so Deploy can pre-tick one device's part.
     #[serde(default)]
     pub profiles: BTreeMap<String, Selection>,
+    /// Set while direct play is on.
+    #[serde(default)]
+    pub play: Option<PlayState>,
+    /// Other machines that added ROMs to this drive: machine name -> last time (unix).
+    #[serde(default)]
+    pub contributors: BTreeMap<String, u64>,
 }
 
 pub fn path(root: &Path) -> PathBuf {
@@ -85,9 +125,9 @@ fn now() -> u64 {
 /// from the same ES-DE folder), so repeated exports of different systems accumulate.
 /// With a `profile`, the selection is recorded under that name too.
 pub fn for_export(existing: Option<Manifest>, cat: &Catalog, sel: &Selection, profile: Option<&str>) -> Manifest {
-    let (mut base, mut profiles) = match existing {
-        Some(m) if eq_ci(&m.catalog.roots.es_root, &cat.roots.es_root) => (m.catalog, m.profiles),
-        _ => (Catalog::default(), BTreeMap::new()),
+    let (mut base, mut profiles, play, contributors) = match existing {
+        Some(m) if eq_ci(&m.catalog.roots.es_root, &cat.roots.es_root) => (m.catalog, m.profiles, m.play, m.contributors),
+        _ => (Catalog::default(), BTreeMap::new(), None, BTreeMap::new()),
     };
     if let Some(name) = profile {
         profiles.insert(name.to_string(), sel.clone());
@@ -135,7 +175,54 @@ pub fn for_export(existing: Option<Manifest>, cat: &Catalog, sel: &Selection, pr
         complete: false,
         catalog: base,
         profiles,
+        play,
+        contributors,
     }
+}
+
+/// Another machine added ROMs to this direct-play drive: its systems are recorded under
+/// the drive owner's folders (`existing.catalog.roots`), with the files counted on the
+/// drive. Everything else about the drive stays the owner's.
+pub fn for_merge(mut existing: Manifest, pkg_root: &Path, cat: &Catalog, sel: &Selection) -> Manifest {
+    let owner = existing.catalog.roots.clone();
+    for s in cat.systems.iter().filter(|s| sel.systems.contains(&s.name)) {
+        let Some(rel) = crate::paths::strip_prefix_ci(&s.rom_dir, &cat.roots.rom_dir).filter(|r| !r.as_os_str().is_empty()) else { continue };
+        let rom_dir = owner.rom_dir.join(&rel);
+        let on_drive = crate::paths::mirror(pkg_root, &rom_dir);
+        if !on_drive.is_dir() {
+            continue;
+        }
+        let list = crate::games::list(&on_drive);
+        let media = s
+            .media_dir
+            .as_ref()
+            .filter(|_| sel.media)
+            .and_then(|d| crate::paths::strip_prefix_ci(d, &cat.roots.media_dir))
+            .map(|r| owner.media_dir.join(r))
+            .filter(|d| crate::paths::mirror(pkg_root, d).is_dir());
+        match existing.catalog.systems.iter_mut().find(|o| o.name == s.name) {
+            Some(o) => {
+                (o.rom_files, o.rom_bytes) = (list.files, list.bytes);
+                if o.media_dir.is_none() {
+                    o.media_dir = media;
+                }
+            }
+            None => existing.catalog.systems.push(crate::scan::SysEntry {
+                rom_dir,
+                rom_files: list.files,
+                rom_bytes: list.bytes,
+                gamelist_dir: None,
+                gamelist_bytes: 0,
+                media_dir: media,
+                games: None,
+                ..s.clone()
+            }),
+        }
+    }
+    existing.catalog.systems.sort_by_key(|s| s.fullname.to_lowercase());
+    let here = std::env::var("COMPUTERNAME").unwrap_or_default();
+    existing.contributors.insert(if here.is_empty() { "another PC".into() } else { here }, now());
+    existing
 }
 
 pub fn age_text(m: &Manifest) -> String {
@@ -182,14 +269,21 @@ mod tests {
         // an export without a profile leaves them alone
         let m3 = for_export(Some(m2.clone()), &cat, &sel2, None);
         assert_eq!(m3.profiles.len(), 2);
+        // direct play stays on across exports
+        let mut on = m3.clone();
+        on.play = Some(PlayState { enabled_unix: 5, ..Default::default() });
+        assert_eq!(for_export(Some(on), &cat, &sel2, None).play.map(|p| p.enabled_unix), Some(5));
 
         save(tmp.path(), &m2).unwrap();
         let back = load(tmp.path()).unwrap().unwrap();
         assert_eq!((back.catalog.systems.len(), back.profiles.len()), (2, 2));
         // a manifest written before profiles still reads
         let mut old: serde_json::Value = serde_json::to_value(&back).unwrap();
-        old.as_object_mut().unwrap().remove("profiles");
-        assert!(serde_json::from_value::<Manifest>(old).unwrap().profiles.is_empty());
+        for field in ["profiles", "play", "contributors"] {
+            old.as_object_mut().unwrap().remove(field);
+        }
+        let old = serde_json::from_value::<Manifest>(old).unwrap();
+        assert!(old.profiles.is_empty() && old.play.is_none() && old.contributors.is_empty());
     }
 
     #[test]

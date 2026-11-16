@@ -81,7 +81,7 @@ const SAVE_DIRS: [&str; 16] = [
     "memorycards", "ppsspp_state", "battery", "gc", "wii",
 ];
 const SAVE_EXTS: [&str; 14] = ["srm", "sav", "state", "mcd", "mcr", "ps2", "gci", "dsv", "sra", "eep", "fla", "mpk", "rtc", "vmu"];
-const SETTING_EXTS: [&str; 8] = ["ini", "cfg", "yml", "yaml", "toml", "json", "xml", "conf"];
+pub(crate) const SETTING_EXTS: [&str; 8] = ["ini", "cfg", "yml", "yaml", "toml", "json", "xml", "conf"];
 
 /// Sorts a file below an emulator folder. `None`: not listed at all.
 pub fn classify(rel: &Path) -> Option<Class> {
@@ -287,7 +287,7 @@ mod tests {
         let cat = scan(&es, &AtomicBool::new(false), &mut |_| {}).unwrap();
         let (tx, _rx) = crossbeam_channel::unbounded();
         let no = AtomicBool::new(false);
-        let opts = PlanOptions { protect_newer: true, prune: false };
+        let opts = PlanOptions { protect_newer: true, prune: false, add_only: false };
         let drive = tmp.join("drive");
         fs::create_dir_all(&drive).unwrap();
         let p = build(&groups_for(&cat, &all(&cat)), &Mapper::Export { dest_root: drive.clone() }, &opts, &no, &mut |_| {}).unwrap();

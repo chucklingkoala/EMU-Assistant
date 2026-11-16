@@ -105,7 +105,7 @@ pub fn source_for(id: &str, overrides: &BTreeMap<String, SourceSpec>) -> Option<
 }
 
 /// Find-rule ids for launchers rather than emulators.
-const NOT_EMULATORS: [&str; 2] = ["STEAM", "OS-SHELL"];
+pub(crate) const NOT_EMULATORS: [&str; 2] = ["STEAM", "OS-SHELL"];
 
 /// ES-DE plus every emulator from `es_find_rules.xml` whose exe exists on this machine.
 /// Windows components (cmd.exe and the like) are left out.
@@ -357,6 +357,49 @@ fn cores_needing_update(local: &[(String, i64)], remote: &HashMap<String, (i64, 
                 remote_unix: ts,
                 size,
             })
+        })
+        .collect()
+}
+
+/// A program that isn't installed yet, for [`install`] to fetch into `dir`. `exe` is the
+/// file name to look for in the archive (may hold `*`).
+pub fn fresh_item(http: &Http, id: &str, dir: &Path, exe: &str, spec: SourceSpec) -> Result<UpdateItem> {
+    let rel = sources::latest(http, &spec)?;
+    Ok(UpdateItem {
+        program: Program { id: id.into(), dir: dir.to_path_buf(), exe: dir.join(exe) },
+        source: Some(spec),
+        installed: "not installed".into(),
+        latest: Some(rel),
+        status: Status::Available,
+        cores: Vec::new(),
+        cores_note: None,
+    })
+}
+
+/// The cores in `wanted` (e.g. `snes9x_libretro.dll`) that RetroArch in `ra_dir` lacks and
+/// the buildbot has, as an item that installs only them.
+pub fn missing_cores_item(http: &Http, ra_dir: &Path, wanted: &[String]) -> Result<UpdateItem> {
+    let remote = parse_core_index(&http.get_text(&format!("{BUILDBOT}{CORES_INDEX}"))?);
+    let cores = cores_wanted(ra_dir, wanted, &remote);
+    Ok(UpdateItem {
+        program: Program { id: "RETROARCH".into(), dir: ra_dir.to_path_buf(), exe: ra_dir.join("retroarch.exe") },
+        source: None,
+        installed: String::new(),
+        latest: None,
+        status: Status::UpToDate,
+        cores,
+        cores_note: None,
+    })
+}
+
+fn cores_wanted(ra_dir: &Path, wanted: &[String], remote: &HashMap<String, (i64, u64)>) -> Vec<CoreUpdate> {
+    wanted
+        .iter()
+        .filter(|f| !ra_dir.join("cores").join(f).is_file())
+        .filter_map(|f| {
+            let zip = format!("{f}.zip");
+            let &(ts, size) = remote.get(&zip.to_lowercase())?;
+            Some(CoreUpdate { file: f.clone(), url: format!("{BUILDBOT}{CORES_INDEX}{zip}"), remote_unix: ts, size })
         })
         .collect()
 }
@@ -981,6 +1024,45 @@ mod tests {
         assert_eq!(fs::read(mgba.join("mGBA.exe")).unwrap(), old_exe);
         assert!(read_marker(&mgba).is_none());
         eprintln!("restored {} files, removed {}", r.copied, r.pruned);
+    }
+
+    #[test]
+    fn installs_a_program_that_is_not_there_yet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip = tmp.path().join("emu.zip");
+        archive::tests::make_zip(&zip, &[("emu-1.0/emu-x64.exe", b"exe"), ("emu-1.0/data/a.bin", b"a")]);
+        let dir = tmp.path().join(r"ES-DE\Emulators\Emu");
+        let item = UpdateItem {
+            program: Program { id: "FRESHEMU".into(), dir: dir.clone(), exe: dir.join("emu*.exe") },
+            source: Some(SourceSpec { kind: sources::Kind::Url, repo: "https://example.invalid/emu.zip".into(), host: String::new(), asset: String::new() }),
+            installed: "not installed".into(),
+            latest: Some(Release { version: "1.0".into(), asset_name: "emu.zip".into(), asset_url: "https://example.invalid/emu.zip".into(), ..Default::default() }),
+            status: Status::Available,
+            cores: vec![],
+            cores_note: None,
+        };
+        assert!(item.needs_main());
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut o = opts(&tmp.path().join("backups"));
+        o.backup = false;
+        let r = install_from_local(&item, &zip, &o, &AtomicBool::new(false), &tx);
+        assert!(r.failed.is_empty(), "{:?}", r.failed);
+        assert_eq!(fs::read(dir.join("emu-x64.exe")).unwrap(), b"exe");
+        assert!(dir.join(r"data\a.bin").is_file());
+        assert_eq!(read_marker(&dir).unwrap().version, "1.0");
+    }
+
+    #[test]
+    fn picks_only_missing_cores() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("cores")).unwrap();
+        fs::write(tmp.path().join(r"cores\snes9x_libretro.dll"), b"x").unwrap();
+        let remote: HashMap<String, (i64, u64)> =
+            [("snes9x_libretro.dll.zip".to_string(), (1, 10)), ("mgba_libretro.dll.zip".to_string(), (2, 20))].into();
+        let wanted = ["snes9x_libretro.dll".to_string(), "mgba_libretro.dll".to_string(), "nope_libretro.dll".to_string()];
+        let got = cores_wanted(tmp.path(), &wanted, &remote);
+        assert_eq!(got.iter().map(|c| c.file.as_str()).collect::<Vec<_>>(), ["mgba_libretro.dll"]);
+        assert!(got[0].url.ends_with("mgba_libretro.dll.zip"));
     }
 
     /// Test hook: runs [`install_one`] with the archive already downloaded.

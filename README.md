@@ -29,7 +29,8 @@ Say your main emulation box has terabytes of games, and your handheld (a ROG All
 1. **Export:** on the main machine, tick the consoles you want. EMU Assistant works out which emulators those consoles use and copies everything to an external drive. This covers the ROMs, the emulators (with their BIOS files, configs and saves), the scraped media, the gamelists and ES-DE itself. Folder paths stay the same.
 2. **Deploy:** plug the drive into the handheld and run `EMUAssistant.exe` from the drive. It copies everything into place and points ES-DE at the new ROM folder.
 3. **Bring back:** saves and save states made on the handheld travel back to the main machine over the same drive, with a backup of every save they replace.
-4. **Update:** check for newer builds of ES-DE, RetroArch (and its cores) and your portable emulators, and install the ones you tick. Every file an update replaces is saved in a zip first, so you can roll it back.
+4. **Direct play (optional):** run ES-DE and the emulators straight from the drive, on any Windows PC and under any drive letter. The drive keeps working for Export and Deploy, and turning it off puts the drive back as it was.
+5. **Update:** check for newer builds of ES-DE, RetroArch (and its cores) and your portable emulators, and install the ones you tick. Every file an update replaces is saved in a zip first, so you can roll it back.
 
 Copies are **incremental and resumable**. Files that are already up to date are skipped, and an interrupted copy picks up where it stopped. **Newer files at the destination are never overwritten**, so save games made on the handheld are safe until you bring them back.
 
@@ -39,6 +40,7 @@ Copies are **incremental and resumable**. Files that are already up to date are 
 - **Pick single games** of a system, e.g. only the Switch games you're playing right now. Their updates and DLC from `_Updates` come along automatically.
 - **Profiles** for several devices: one selection for the ROG Ally, another for the Legion Go, on one shared drive or a drive each. Deploy on each device ticks its own part.
 - **Bring saves back** from the handheld to the main machine: saves and save states are found in the emulator folders and ticked for you, and every save they replace is kept in a backup zip.
+- **Direct play from the drive:** on a fast external SSD, start ES-DE right from the drive on any Windows PC. A report shows what's ready, what will be fixed and which emulators are missing or keep their settings on each PC; missing emulators and RetroArch cores can be downloaded. Other PCs can add their ROMs to the same drive. Fully reversible.
 - **Automatic emulator detection** using ES-DE's own `es_systems.xml` and `es_find_rules.xml`. It respects the alternative emulators you picked in ES-DE, for a whole system or for individual games.
 - **Fuel-can gauge** showing how full the destination drive will be after the sync, and a warning before you run out of space.
 - **Mirrored paths:** `D:\Games\ROMs\snes` on the main box becomes `E:\Games\ROMs\snes` on the drive.
@@ -151,7 +153,64 @@ What is listed and what is ticked:
 
 On the main machine, every save that is about to be replaced is first put in a backup zip in the same backups folder the updates use (one zip per emulator, the last 3 per emulator kept). To undo, press **Restore…** in the Bring back tab and tick the backup, or expand it and tick single saves.
 
-### 4. Update programs
+### 4. Direct play: run ES-DE straight from the drive
+
+<img src="docs/images/direct-play.png" alt="Direct play window with the drive's report before enabling" width="900">
+
+An export drive normally only carries your setup to another machine. With **Direct play** on, the same drive also *runs* it: plug it into any Windows PC, start ES-DE from the drive, and it finds its ROMs and emulators there, whatever drive letter it gets. Use a fast external SSD formatted as NTFS; ES-DE is slow from exFAT and from spinning disks.
+
+The drive stays a normal export drive. **Export** to it, **Deploy** from it (with profiles and picked games) and **Bring back** all work exactly as before, also while Direct play is on.
+
+**Turning it on**
+
+1. Export as usual, with **ES-DE application** and **ES-DE settings** ticked in the ES-DE section, so ES-DE itself is on the drive.
+2. Run `EMUAssistant.exe` from the drive. In the **Deploy** tab, press **Direct play…**. EMU Assistant checks the drive and shows a report (nothing is changed yet):
+   - **General:** whether ES-DE runs in portable mode and finds the ROM and media folders under any drive letter. A note appears when the drive isn't NTFS.
+   - **Emulators,** for every emulator the consoles on the drive use:
+     - *ready*: on the drive, and ES-DE finds it there.
+     - *will be registered with ES-DE*: on the drive, but outside the ES-DE folder, so ES-DE wouldn't look there. Enable fixes that.
+     - *not on this drive*: it wasn't exported (often because it's installed under `Program Files`). Tick **download** to fetch it, when EMU Assistant knows where its releases come from (see [Where updates come from](#where-updates-come-from)).
+     - *switch to portable mode*: the emulator keeps its settings in your Windows user profile on each PC. Tick it to keep them on the drive instead. They start out empty there; settings and BIOS files from the PC's user profile aren't copied.
+     - *portable mode unknown*: EMU Assistant doesn't know how this emulator stores its settings.
+   - **RetroArch cores** that the consoles need but that aren't in RetroArch's `cores` folder; tick to download them.
+   - **Emulator settings** that still name folders of the main machine. RetroArch's are fixed for you; for other emulators, change them in the emulator while it runs from the drive.
+3. Press **Enable direct play** (or **Download … selected and enable** when you ticked downloads).
+4. Press **Start ES-DE**. You can also start `ES-DE.exe` on the drive directly, or make a shortcut to `EMUAssistant.exe --play` (see below).
+
+<img src="docs/images/direct-play-on.png" alt="Direct play on, with the list of files it changed" width="900">
+
+**What Enable changes on the drive.** Only a few files, and each one is listed under **Changed on this drive** in the window:
+
+- creates `portable.txt` next to `ES-DE.exe`, if it's missing;
+- sets `ROMDirectory` and `MediaDirectory` in `es_settings.xml` to paths relative to the ES-DE folder (`%ESPATH%\..\Games\ROMs`);
+- adds a marked section to `ES-DE\custom_systems\es_find_rules.xml` for the emulators outside the ES-DE folder. An emulator you had your own custom rule for is moved into that section, with your rules kept after the new one;
+- in `retroarch.cfg`, turns folders that point into RetroArch's folder on the main machine into RetroArch's own relative form (`:\saves`);
+- creates the portable-mode file or folder of the emulators you ticked.
+
+The original of every file it changes is kept in `EMUAssistant\play-orig` on the drive.
+
+**Keeping it on.** Exporting to the drive again replaces some of these files with the main machine's versions. EMU Assistant applies the changes again at the end of every export, and before every **Start ES-DE**, so the drive keeps working. The version the export brought becomes the new original.
+
+**Deploy is not affected.** Deploying from a Direct play drive copies the originals, never the changed files, and leaves out the files Direct play created and the emulators it downloaded. The target machine gets exactly what it would have got without Direct play.
+
+**Turning it off.** Press **Turn off…** in the Direct play window. The changed files get their originals back and the files Direct play created are deleted, so the drive is back as it was. Tick *Also remove the emulators downloaded for direct play* to delete those as well. Settings you changed in ES-DE or RetroArch *while playing from the drive* live in those same files and are lost; saves are kept.
+
+<img src="docs/images/direct-play-merge.png" alt="Export from a second PC to a Direct play drive: only ROMs and media are added, a different file of the same name is kept" width="900">
+
+**Adding ROMs from other PCs.** Export from a second PC to a Direct play drive and EMU Assistant notices that the drive belongs to another machine. It then adds only that PC's **ROMs and scraped media**, into the drive's own ROM and media folders, so ES-DE on the drive lists them. Nothing else is sent: no emulators, ES-DE files, settings, gamelists or saves. Files already on the drive are never overwritten; a game with the same name but different content is kept and listed after Analyze. Nothing is deleted. The new consoles can be deployed from the drive like any others; their emulators show up in the Direct play report, ready to download if the drive doesn't have them. Added games appear unscraped until you scrape them in ES-DE.
+
+If the drive's own machine later exports with *Delete files missing from source* on, the ROMs other PCs added are in the delete list too; the confirmation names those PCs.
+
+**Limits**
+
+- Windows only.
+- Settings and BIOS files that an emulator keeps in your user profile (`%APPDATA%`, Documents) aren't brought to the drive.
+- Only `retroarch.cfg` is rewritten. Paths inside other emulators' settings are reported, not changed.
+- Which emulators need a portable-mode file is known for a short list (DuckStation, PCSX2, Dolphin, Xenia, mGBA, Cemu, Ryujinx, Citra, Azahar, Eden; RetroArch and RPCS3 always keep everything in their folder). Others are shown as *unknown*.
+- Downloads aren't checked against a checksum (only EMU Assistant's own update is).
+- With *Keep newer files at destination* on, a change to `es_settings.xml` or `retroarch.cfg` on the main machine reaches the drive once the main machine's file is newer than the drive's.
+
+### 5. Update programs
 
 <img src="docs/images/update.png" alt="Update programs screen after a check" width="900">
 
@@ -288,6 +347,11 @@ Emulators that live **outside** the ES-DE folder are still copied, to the same p
   EMUAssistant.exe --dump "D:\Emulation\ES-DE"
   ```
   This prints the detected ROM and media folders, every system with its emulators, and where each emulator was found. Add `--games` to also list every game with the updates and DLC matched to it.
+- **Start ES-DE from a Direct play drive** (for a desktop shortcut):
+  ```
+  E:\EMUAssistant.exe --play [E:\]
+  ```
+  This applies the Direct play changes again if an export replaced any, then starts ES-DE from the drive. The folder defaults to the one the exe is in. The exit code is 0 when ES-DE started, and 2 when it didn't (no package there, or Direct play is off).
 - **Check for updates without the GUI:**
   ```
   EMUAssistant.exe --check-updates "D:\Emulation\ES-DE"
@@ -296,7 +360,7 @@ Emulators that live **outside** the ES-DE folder are still copied, to the same p
   ```
   EMUAssistant.exe --export [--profile "ROG Ally"] [--dest E:\] ["D:\Emulation\ES-DE"]
   ```
-  This exports the selection you last used in the window, or the profile's, to its destination. It copies only and never deletes anything on the drive, even if *Delete files missing from source* was on. The exit code is 0 when it finished, 1 when some files failed, and 2 when it didn't start (no such profile, the drive isn't plugged in, not enough space). Each run writes a log to `%APPDATA%\EMUAssistant\logs` (the last 10 are kept).
+  This exports the selection you last used in the window, or the profile's, to its destination. It copies only and never deletes anything on the drive, even if *Delete files missing from source* was on. On a [Direct play](#4-direct-play-run-es-de-straight-from-the-drive) drive set up by another PC it adds only this PC's ROMs and media. The exit code is 0 when it finished, 1 when some files failed, and 2 when it didn't start (no such profile, the drive isn't plugged in, not enough space). Each run writes a log to `%APPDATA%\EMUAssistant\logs` (the last 10 are kept).
   To run it every night with Windows Task Scheduler: `schtasks /create /tn "EMU Assistant export" /sc daily /st 03:00 /tr "\"C:\Tools\EMUAssistant.exe\" --export --profile \"ROG Ally\""`.
 - **An update says the download doesn't contain the program:** the project changed its file names. Open **⚙ Settings > Update sources** and adjust the file pattern.
 - Your last ES-DE folder, destination, selection, profiles and settings are remembered in `%APPDATA%\EMUAssistant\config.json`. Settings from earlier versions (`%APPDATA%\EMU Assistant`) are picked up automatically. To keep them somewhere else (for a test, or a portable setup), set the environment variable `EMUASSISTANT_CONFIG_DIR` to a folder.
@@ -322,19 +386,23 @@ cargo test
 
 ```
 src/
-  main.rs            entry point, window setup, --dump, --check-updates, --export
+  main.rs            entry point, window setup, --dump, --check-updates, --export, --play
   ui/                egui interface: mod.rs (state and jobs), one file per screen and window
+                     (play_view.rs: the Direct play window)
   select.rs          default selections, emulators that go along, sizes, space checks
-  export.rs          an export run (window and --export)
+  export.rs          an export run (window and --export), also adding ROMs to a Direct play drive
   bringback.rs       finding and copying saves back, with their backup
+  play.rs            Direct play: drive check, enable / turn off, the list of changed files,
+                     what Deploy reads instead
   gauge.rs           fuel-can widget
   gauge_geom.rs      liquid-surface geometry for the can sprites
   scan.rs            reads an ES-DE install into systems / emulators / groups
   games.rs           splits a system folder into games, matches updates/DLC to them
   esde/              parsers for es_settings, es_systems, es_find_rules, gamelist.xml
-  plan.rs            selection -> copy groups -> diff against destination
+  plan.rs            selection -> copy groups -> diff against destination (export, deploy with the
+                     Direct play overlay, merge of another PC's ROMs)
   sync.rs            copying (atomic .part + rename, mtime, verify, delete)
-  manifest.rs        the package description stored on the drive
+  manifest.rs        the package description stored on the drive, with the Direct play state
   deploy.rs          es_settings.xml fix-up on the target
   drives.rs          drive list and free space (Win32)
   update/            Update mode: sources.rs (where releases come from), http.rs (answer cache,

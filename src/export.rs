@@ -22,6 +22,9 @@ pub struct Job<'a> {
     pub profile: Option<&'a str>,
     pub verify: bool,
     pub copy_exe: bool,
+    /// Adding this machine's ROMs to a direct-play drive another machine set up
+    /// (the plan was made with [`crate::plan::Mapper::Merge`]).
+    pub merge: bool,
 }
 
 /// Writes the manifest (marked incomplete), copies, marks it complete when nothing
@@ -34,11 +37,33 @@ pub fn run(job: &Job, cancel: &AtomicBool, tx: &Sender<Event>) -> Report {
         log(format!("Ignoring unreadable manifest: {e:#}"));
         None
     });
+    if job.merge {
+        let report = sync::execute(job.plan, job.verify, cancel, tx);
+        match existing {
+            Some(owner) => {
+                let mut m = manifest::for_merge(owner, job.dest_root, job.cat, job.sel);
+                for l in crate::play::reapply(job.dest_root, &mut m) {
+                    log(l);
+                }
+                if let Err(e) = manifest::save(job.dest_root, &m) {
+                    log(format!("Could not write manifest: {e:#}"));
+                }
+            }
+            None => log("The drive's manifest could not be read; the added ROMs are on the drive but not listed for Deploy".into()),
+        }
+        return report;
+    }
     let mut m = manifest::for_export(existing, job.cat, job.sel, job.profile);
     if let Err(e) = manifest::save(job.dest_root, &m) {
         log(format!("Could not write manifest: {e:#}"));
     }
     let report = sync::execute(job.plan, job.verify, cancel, tx);
+    // the export may have replaced files direct play had changed
+    if m.play.is_some() && !report.cancelled {
+        for l in crate::play::reapply(job.dest_root, &mut m) {
+            log(l);
+        }
+    }
     m.complete = !report.cancelled && report.failed.is_empty();
     if let Err(e) = manifest::save(job.dest_root, &m) {
         log(format!("Could not write manifest: {e:#}"));
@@ -96,20 +121,29 @@ pub fn headless(args: &Headless, mut cfg: crate::config::Config, out: &(dyn Fn(S
     let cat = scan::scan(&es_root, &no, &mut |_| {}).map_err(|e| NotStarted(format!("scan failed: {e:#}")))?;
     let mut sel = select::export_selection(&cat, &cfg);
     sel.emulators = select::effective_emus(&cat, &sel, &cfg.emu_override);
-    let groups = plan::groups_for(&cat, &sel);
+    // a direct-play drive set up by another machine only takes this machine's ROMs
+    let owner = manifest::load(&dest).ok().flatten().and_then(|m| crate::play::merge_owner(&m, &cat.roots.es_root));
+    let (groups, mapper) = match &owner {
+        Some((roots, machine)) => {
+            out(format!("{} is a direct-play drive set up by {machine}: adding this machine's ROMs and media only", dest.display()));
+            let (g, warnings) = plan::merge_groups(&cat, &sel);
+            warnings.into_iter().for_each(|w| out(format!("Warning: {w}")));
+            (g, plan::Mapper::merge(&dest, &cat.roots, roots))
+        }
+        None => (plan::groups_for(&cat, &sel), plan::Mapper::Export { dest_root: dest.clone() }),
+    };
     if sel.systems.is_empty() && groups.is_empty() {
         return fail("nothing is selected; pick the consoles in the window first".into());
     }
     out(format!(
         "Comparing {} systems, {} emulators with {}{}",
         sel.systems.len(),
-        sel.emulators.len(),
+        if owner.is_some() { 0 } else { sel.emulators.len() },
         dest.display(),
         args.profile.as_ref().map(|p| format!(" (profile {p})")).unwrap_or_default()
     ));
-    let opts = plan::PlanOptions { protect_newer: cfg.protect_newer(), prune: false };
-    let plan = plan::build(&groups, &plan::Mapper::Export { dest_root: dest.clone() }, &opts, &no, &mut |_| {})
-        .map_err(|e| NotStarted(format!("analyze failed: {e:#}")))?;
+    let opts = plan::PlanOptions { protect_newer: cfg.protect_newer(), prune: false, add_only: owner.is_some() };
+    let plan = plan::build(&groups, &mapper, &opts, &no, &mut |_| {}).map_err(|e| NotStarted(format!("analyze failed: {e:#}")))?;
     for w in &plan.warnings {
         out(format!("Warning: {w}"));
     }
@@ -125,6 +159,9 @@ pub fn headless(args: &Headless, mut cfg: crate::config::Config, out: &(dyn Fn(S
         plan.skipped,
         plan.protected.len()
     ));
+    if !plan.kept.is_empty() {
+        out(format!("Already on the drive with different content (kept): {}", plan.kept.len()));
+    }
 
     let (tx, rx) = crossbeam_channel::unbounded();
     let job = Job {
@@ -135,6 +172,7 @@ pub fn headless(args: &Headless, mut cfg: crate::config::Config, out: &(dyn Fn(S
         profile: cfg.active_profile.as_deref(),
         verify: cfg.verify(),
         copy_exe: cfg.copy_exe(),
+        merge: owner.is_some(),
     };
     let report = std::thread::scope(|s| {
         s.spawn(|| {

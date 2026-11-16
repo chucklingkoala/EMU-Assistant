@@ -3,6 +3,7 @@
 
 mod bringback_view;
 mod games_view;
+mod play_view;
 mod self_update;
 mod settings;
 mod shell;
@@ -30,6 +31,7 @@ use crate::gauge::{self, TankReading, TankTextures, ACCENT};
 use crate::manifest::{self, Manifest};
 use crate::paths::{eq_ci, mirror, normalize, volume_root};
 use crate::plan::{self, Mapper, Plan, PlanOptions, Selection};
+use crate::play;
 use crate::scan::{self, Catalog, Roots};
 use crate::sync::{self, Event, Progress, Report};
 use crate::update::app::{self as app_update, AppRelease, OldCopy};
@@ -95,6 +97,8 @@ enum After {
     AppUpdated,
     /// Bring back: look for changes again.
     BroughtBack,
+    /// Direct play was turned on, off, or got downloads: reload the manifest, check again.
+    PlayChanged,
 }
 
 enum Job {
@@ -106,6 +110,8 @@ enum Job {
     Games { rx: Receiver<Msg<Vec<(String, GameList)>>>, cancel: Arc<AtomicBool>, open: Option<String> },
     /// Bring back: comparing the emulator folders.
     Find { rx: Receiver<Msg<bringback::Found>>, cancel: Arc<AtomicBool> },
+    /// Direct play: checking the drive.
+    PlayCheck { rx: Receiver<Msg<play::Report>>, cancel: Arc<AtomicBool> },
 }
 
 impl Job {
@@ -116,7 +122,8 @@ impl Job {
             | Job::Check { cancel, .. }
             | Job::Copy { cancel, .. }
             | Job::Games { cancel, .. }
-            | Job::Find { cancel, .. } => cancel.store(true, Ordering::Relaxed),
+            | Job::Find { cancel, .. }
+            | Job::PlayCheck { cancel, .. } => cancel.store(true, Ordering::Relaxed),
         }
     }
 }
@@ -160,6 +167,21 @@ pub struct App {
     bb_ticked: BTreeSet<usize>,
     /// Groups opened or closed by the user, away from their default ("emu" or "emu/Class").
     bb_toggled: BTreeSet<String>,
+    // direct play
+    play_open: bool,
+    play_report: Option<Arc<play::Report>>,
+    /// Emulators ticked for portable mode.
+    play_portable: BTreeSet<String>,
+    /// Emulators (and "ES-DE", "cores") ticked for download.
+    play_download: BTreeSet<String>,
+    play_confirm_off: bool,
+    play_remove_added: bool,
+    /// Export: the destination is a direct-play drive another machine set up (its roots
+    /// and machine name), and the destination text that was checked.
+    export_merge: Option<(Roots, String)>,
+    export_merge_for: String,
+    /// Export: other machines that added ROMs to the destination drive.
+    export_contributors: Vec<String>,
     // update
     upd_items: Vec<UpdateItem>,
     upd_root: Option<PathBuf>,
@@ -233,6 +255,15 @@ impl App {
             bb_found: None,
             bb_ticked: BTreeSet::new(),
             bb_toggled: BTreeSet::new(),
+            play_open: false,
+            play_report: None,
+            play_portable: BTreeSet::new(),
+            play_download: BTreeSet::new(),
+            play_confirm_off: false,
+            play_remove_added: false,
+            export_merge: None,
+            export_merge_for: String::new(),
+            export_contributors: Vec::new(),
             upd_items: Vec::new(),
             upd_root: None,
             upd_checked: false,
@@ -556,6 +587,8 @@ impl App {
                 self.bb_dir = if !here.is_empty() && m.source_machine.eq_ignore_ascii_case(&here) { Direction::ToMachine } else { Direction::ToDrive };
                 self.bb_found = None;
                 self.bb_ticked.clear();
+                self.play_report = None;
+                self.play_download.clear();
                 self.manifest = Some(m);
                 self.apply_defaults();
                 self.find_old_copies();
@@ -581,7 +614,11 @@ impl App {
                 if !dest.is_dir() {
                     return Err(format!("Destination {} does not exist", dest.display()));
                 }
-                Ok(Mapper::Export { dest_root: dest })
+                // a direct-play drive another machine set up only takes this machine's ROMs
+                match (&self.export_merge, &self.export_cat) {
+                    (Some((owner, _)), Some(cat)) => Ok(Mapper::merge(&dest, &cat.roots, owner)),
+                    _ => Ok(Mapper::Export { dest_root: dest }),
+                }
             }
             Mode::Deploy | Mode::BringBack => {
                 let cat = self.deploy_cat.as_ref().ok_or_else(|| "Load a package first".to_string())?;
@@ -589,13 +626,34 @@ impl App {
                 abs(&self.t_es, "Target ES-DE folder")?;
                 abs(&self.t_rom, "Target ROM folder")?;
                 abs(&self.t_media, "Target media folder")?;
-                Ok(Mapper::deploy(&pkg, &cat.roots, &self.target_roots()))
+                let m = Mapper::deploy(&pkg, &cat.roots, &self.target_roots());
+                // direct play's changes stay on the drive
+                Ok(match &self.manifest {
+                    Some(man) if man.play.is_some() => m.with_overlay(play::overlay(&pkg, man)),
+                    _ => m,
+                })
             }
         }
     }
 
+    /// Export: whether the destination is a direct-play drive another machine set up.
+    pub(super) fn refresh_export_merge(&mut self) {
+        let dest = normalize(Path::new(self.dest.trim()));
+        self.export_merge_for = self.dest.clone();
+        let m = if dest.is_absolute() && dest.is_dir() { manifest::load(&dest).ok().flatten() } else { None };
+        self.export_contributors = m.as_ref().map(|m| m.contributors.keys().cloned().collect()).unwrap_or_default();
+        self.export_merge = match (&self.export_cat, &m) {
+            (Some(cat), Some(m)) => play::merge_owner(m, &cat.roots.es_root),
+            _ => None,
+        };
+    }
+
     fn start_plan(&mut self) {
         let Some(cat) = self.cat() else { return };
+        if self.mode == Mode::Export {
+            self.refresh_export_merge();
+        }
+        let merge = self.mode == Mode::Export && self.export_merge.is_some();
         let mapper = match self.mapper() {
             Ok(m) => m,
             Err(e) => {
@@ -617,12 +675,20 @@ impl App {
             self.status = "Reading the picked games on the drive first; press Analyze again when that is done.".into();
             return;
         }
-        let groups = plan::groups_for(&cat, &self.sel);
+        let groups = if merge {
+            let (g, warnings) = plan::merge_groups(&cat, &self.sel);
+            for w in warnings {
+                self.log(format!("Warning: {w}"));
+            }
+            g
+        } else {
+            plan::groups_for(&cat, &self.sel)
+        };
         if groups.is_empty() {
             self.status = "Nothing selected".into();
             return;
         }
-        let opts = PlanOptions { protect_newer: self.cfg.protect_newer(), prune: self.prune };
+        let opts = PlanOptions { protect_newer: self.cfg.protect_newer(), prune: self.prune && !merge, add_only: merge };
         let (tx, rx) = unbounded();
         let cancel = Arc::new(AtomicBool::new(false));
         let c = cancel.clone();
@@ -656,9 +722,11 @@ impl App {
         match self.mode {
             Mode::Update | Mode::BringBack => return,
             Mode::Export => {
-                let (Some(cat), Ok(Mapper::Export { dest_root })) = (self.export_cat.clone(), self.mapper()) else {
+                let (Some(cat), Ok(mapper)) = (self.export_cat.clone(), self.mapper()) else {
                     return;
                 };
+                let merge = matches!(mapper, Mapper::Merge { .. });
+                let dest_root = normalize(Path::new(self.dest.trim()));
                 let sel = self.sel.clone();
                 let copy_exe = self.cfg.copy_exe();
                 let profile = self.cfg.active_profile.clone();
@@ -673,6 +741,7 @@ impl App {
                         profile: profile.as_deref(),
                         verify,
                         copy_exe,
+                        merge,
                     };
                     let report = crate::export::run(&job, &c, &tx);
                     let _ = tx.send(Event::Done(report));
@@ -731,6 +800,16 @@ impl App {
         thread::spawn(move || {
             let res = bringback::find(&cat, &mapper, dir, &c, &mut |s| {
                 let _ = tx.send(Msg::Status(s));
+            });
+            // direct play's own files on the drive are not saves to carry
+            let res = res.map(|mut f| {
+                if let Some(o) = mapper.overlay() {
+                    f.items.retain(|i| {
+                        let drive_side = if dir == Direction::ToDrive { &i.dst } else { &i.src };
+                        !o.hides(drive_side) && !o.swap.contains_key(&crate::paths::key(drive_side))
+                    });
+                }
+                f
             });
             let _ = tx.send(Msg::Done(res));
         });
@@ -1011,6 +1090,7 @@ impl App {
                     self.cfg.es_root = Some(cat.roots.es_root.clone());
                     config::save(&self.cfg);
                     self.export_cat = Some(Arc::new(cat));
+                    self.refresh_export_merge();
                     self.apply_defaults();
                     None
                 }
@@ -1080,6 +1160,24 @@ impl App {
                 }
                 Some(Err(e)) => {
                     self.status = format!("Could not compare: {e:#}");
+                    None
+                }
+            },
+            Job::PlayCheck { rx, cancel } => match drain(&rx, &mut self.status) {
+                None => Some(Job::PlayCheck { rx, cancel }),
+                Some(Ok(r)) => {
+                    self.status = match (&r.blocker, r.enabled) {
+                        (Some(_), _) => "Direct play can't be enabled on this drive; see the window".into(),
+                        (None, true) => "Drive checked".into(),
+                        (None, false) => "Drive checked; see the Direct play window".into(),
+                    };
+                    self.play_portable = self.manifest.as_ref().and_then(|m| m.play.as_ref()).map(|p| p.make_portable.clone()).unwrap_or_default();
+                    self.play_download.retain(|id| r.emulators.iter().any(|e| &e.id == id) || id == play_view::DL_CORES);
+                    self.play_report = Some(Arc::new(r));
+                    None
+                }
+                Some(Err(e)) => {
+                    self.status = format!("Could not check the drive: {e:#}");
                     None
                 }
             },
@@ -1180,6 +1278,23 @@ impl App {
                     self.start_find();
                 }
             }
+            After::PlayChanged => {
+                for f in r.failed.iter().take(200) {
+                    self.log(format!("Error: {f}"));
+                }
+                self.progress = None;
+                let pkg = normalize(Path::new(self.pkg_root.trim()));
+                if let Ok(Some(m)) = manifest::load(&pkg) {
+                    self.manifest = Some(m);
+                }
+                // Deploy reads the drive differently now
+                self.plan = None;
+                self.bb_found = None;
+                self.bb_ticked.clear();
+                if !self.quit_when_idle {
+                    self.start_play_check();
+                }
+            }
             After::Updated | After::Restored => {
                 let s = update_summary(&r, after);
                 self.log(s.clone());
@@ -1265,6 +1380,9 @@ impl eframe::App for App {
         }
         if self.games_open.is_some() {
             self.ui_games(ctx);
+        }
+        if self.play_open {
+            self.ui_play(ctx);
         }
         if self.app_window {
             self.ui_app_update(ctx);
