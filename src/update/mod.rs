@@ -538,6 +538,21 @@ pub fn install(items: &[UpdateItem], opts: &Opts, cancel: &AtomicBool, tx: &Send
                 report.copied += n;
                 ctx.log(format!("{}: updated ({n} files)", item.id()));
             }
+            // the drive failed: the next programs would fail the same way
+            Err(e) if e.downcast_ref::<DriveFailed>().is_some() => {
+                ctx.log(format!("{}: {e:#}", item.id()));
+                report.failed.push(format!("{}: {e:#}", item.id()));
+                let rest = items.len() - i - 1;
+                if rest > 0 {
+                    let why = format!("Stopped: the drive failed, so the other {rest} programs were not installed");
+                    ctx.log(why.clone());
+                    report.failed.push(why);
+                }
+                for d in ["x", "cores_x"] {
+                    let _ = fs::remove_dir_all(work_dir(item.id()).join(d));
+                }
+                break;
+            }
             Err(e) if cancel.load(Ordering::Relaxed) => {
                 ctx.log(format!("{}: cancelled ({e:#})", item.id()));
                 report.cancelled = true;
@@ -564,9 +579,23 @@ pub fn install(items: &[UpdateItem], opts: &Opts, cancel: &AtomicBool, tx: &Send
     report
 }
 
+/// Installing failed because the drive failed: the remaining programs aren't tried.
+#[derive(Debug)]
+struct DriveFailed(String);
+
+impl std::fmt::Display for DriveFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DriveFailed {}
+
 fn install_one(item: &UpdateItem, ctx: &mut Ctx) -> Result<u64> {
     let p = &item.program;
     let id = item.id();
+    // a program that isn't there yet (a download for direct play)
+    let fresh = !p.dir.exists();
     if in_use(&p.exe) {
         bail!("{} is running; close it and try again", p.exe.file_name().unwrap_or_default().to_string_lossy());
     }
@@ -621,6 +650,8 @@ fn install_one(item: &UpdateItem, ctx: &mut Ctx) -> Result<u64> {
     });
     ensure!(errors.is_empty(), "reading the unpacked update: {}", errors.join("; "));
     let mut todo = Vec::new();
+    // files this install adds, removed again when it fails without a backup
+    let mut new_files: Vec<PathBuf> = Vec::new();
     for src in files {
         let Some(rel) = crate::paths::strip_prefix_ci(&src, &root) else { continue };
         let dst = p.dir.join(&rel);
@@ -637,6 +668,7 @@ fn install_one(item: &UpdateItem, ctx: &mut Ctx) -> Result<u64> {
             replaced.push(SavedFile { path: rel_s, mtime });
         } else {
             added.push(rel_s);
+            new_files.push(dst.clone());
         }
         todo.push((src, dst));
     }
@@ -688,15 +720,34 @@ fn install_one(item: &UpdateItem, ctx: &mut Ctx) -> Result<u64> {
         let mtime = fs::metadata(src).map(|m| FileTime::from_last_modification_time(&m)).unwrap_or_else(|_| FileTime::now());
         // not cancellable mid-way: a half-installed program is worse than a finished one
         if let Err(e) = sync::copy_file(src, dst, mtime, false, &never, &mut |_| {}) {
-            let msg = format!("installing {}: {e}", dst.display());
-            return Err(match &backup {
+            let device = sync::is_device_error(&e);
+            let msg = if device {
+                format!("installing {}: {}", dst.display(), sync::device_hint(&e))
+            } else {
+                format!("installing {}: {e}", dst.display())
+            };
+            let msg = match &backup {
                 Some(zip) => match archive::restore(zip, None, &never) {
-                    Ok(r) if r.failed.is_empty() => anyhow::anyhow!("{msg}. The previous version was restored from the backup."),
-                    Ok(r) => anyhow::anyhow!("{msg}. Restoring the backup also failed for: {}", r.failed.join("; ")),
-                    Err(e2) => anyhow::anyhow!("{msg}. Restoring the backup failed: {e2:#}"),
+                    Ok(r) if r.failed.is_empty() => format!("{msg}. The previous version was restored from the backup."),
+                    Ok(r) => format!("{msg}. Restoring the backup also failed for: {}", r.failed.join("; ")),
+                    Err(e2) => format!("{msg}. Restoring the backup failed: {e2:#}"),
                 },
-                None => anyhow::anyhow!("{msg}. No backup was made; the program may be partly updated."),
-            });
+                // a program that wasn't there before goes away again, instead of staying half-copied
+                None if fresh => match fs::remove_dir_all(long(&p.dir)) {
+                    Ok(()) => format!("{msg}. The partly copied files were removed."),
+                    Err(_) if !p.dir.exists() => format!("{msg}. The partly copied files were removed."),
+                    Err(e2) => format!("{msg}. The partly copied files in {} could not be removed ({e2}); delete that folder.", p.dir.display()),
+                },
+                None => {
+                    let left = new_files.iter().filter(|f| fs::remove_file(long(f)).is_err() && f.exists()).count();
+                    if left == 0 {
+                        format!("{msg}. The files it added were removed; files it replaced may be from the new version.")
+                    } else {
+                        format!("{msg}. No backup was made; the program may be partly updated.")
+                    }
+                }
+            };
+            return Err(if device { anyhow::Error::new(DriveFailed(msg)) } else { anyhow::anyhow!(msg) });
         }
     }
     write_marker_for(item, main)?;
@@ -1050,6 +1101,16 @@ mod tests {
         assert_eq!(fs::read(dir.join("emu-x64.exe")).unwrap(), b"exe");
         assert!(dir.join(r"data\a.bin").is_file());
         assert_eq!(read_marker(&dir).unwrap().version, "1.0");
+    }
+
+    #[test]
+    fn drive_failures_stop_the_run() {
+        let dev = std::io::Error::from_raw_os_error(1117);
+        assert!(sync::is_device_error(&dev) && sync::device_hint(&dev).contains("USB"));
+        assert!(!sync::is_device_error(&std::io::Error::from_raw_os_error(5)));
+        let e = anyhow::Error::new(DriveFailed("x".into()));
+        assert!(e.downcast_ref::<DriveFailed>().is_some());
+        assert_eq!(format!("{e:#}"), "x");
     }
 
     #[test]

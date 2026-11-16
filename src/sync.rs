@@ -181,10 +181,25 @@ fn same_content_buf(a: &Path, b: &Path, bufs: &mut Bufs) -> io::Result<bool> {
 /// After this many failed files in a row the run stops: the drive is most likely gone.
 const MAX_CONSECUTIVE_FAILURES: u32 = 20;
 
-/// Errors after which trying more files is pointless: disk full, device not ready or removed.
+/// Errors after which trying more files is pointless: disk full, or the drive failing.
 fn is_fatal(e: &io::Error) -> bool {
-    // ERROR_NOT_READY 21, ERROR_HANDLE_DISK_FULL 39, ERROR_DISK_FULL 112, ERROR_DEVICE_NOT_CONNECTED 1167
-    e.kind() == io::ErrorKind::StorageFull || matches!(e.raw_os_error(), Some(21 | 39 | 112 | 1167))
+    // ERROR_HANDLE_DISK_FULL 39, ERROR_DISK_FULL 112
+    e.kind() == io::ErrorKind::StorageFull || matches!(e.raw_os_error(), Some(39 | 112)) || is_device_error(e)
+}
+
+/// The drive itself failed or went away, rather than one file: ERROR_NOT_READY 21,
+/// ERROR_DEV_NOT_EXIST 55, ERROR_DEVICE_HARDWARE_ERROR 483, ERROR_FILE_INVALID 1006 (volume
+/// dismounted), ERROR_MEDIA_CHANGED 1110, ERROR_IO_DEVICE 1117, ERROR_DEVICE_NOT_CONNECTED 1167.
+pub fn is_device_error(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(21 | 55 | 483 | 1006 | 1110 | 1117 | 1167))
+}
+
+/// What to tell the user about a device error.
+pub fn device_hint(e: &io::Error) -> String {
+    format!(
+        "the drive reported a hardware or connection error ({e}). This comes from the drive or its USB connection, not from the files: \
+         check the cable and USB port (avoid hubs and front-panel ports), make sure the drive has enough power, and run a disk check on it"
+    )
 }
 
 /// Removes the folders that deleting `file` left empty, up to but not including `root`.
@@ -271,7 +286,9 @@ impl Run<'_> {
                 if is_fatal(&e) || n >= MAX_CONSECUTIVE_FAILURES {
                     // the first thread to stop explains why
                     if !self.stopped.swap(true, Ordering::Relaxed) {
-                        let why = if is_fatal(&e) {
+                        let why = if is_device_error(&e) {
+                            format!("Stopped: {}. The remaining files were not copied.", device_hint(&e))
+                        } else if is_fatal(&e) {
                             format!("Stopped: {e}. The remaining files were not copied.")
                         } else {
                             format!("Stopped after {n} failed files in a row. Is the drive still connected?")
